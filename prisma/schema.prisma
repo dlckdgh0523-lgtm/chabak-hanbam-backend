@@ -1,0 +1,614 @@
+// 차박 하룻밤 — 명세 v1.0 8장 데이터 모델. 전부 프로젝트 제안.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── 계정·장치·차량 ────────────────────────────────────────────────
+
+model User {
+  id                  String    @id @default(uuid())
+  authSubject         String    @unique
+  locale              String    @default("ko-KR")
+  timezone            String    @default("Asia/Seoul")
+  deletionRequestedAt DateTime?
+  createdAt           DateTime  @default(now())
+
+  devices           Device[]
+  vehicleLinks      VehicleLink[]
+  consents          ConsentEvent[]
+  emergencyContacts EmergencyContact[]
+  trips             Trip[]
+  reviews           Review[]
+  refreshTokens     RefreshToken[]
+  alertAcks         AlertAck[]
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  familyId  String
+  expiresAt DateTime
+  usedAt    DateTime?
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+enum DeviceType {
+  CAR
+  PHONE
+  SENSOR
+}
+
+model Device {
+  id                 String     @id @default(uuid())
+  userId             String?
+  type               DeviceType
+  displayName        String?
+  publicKey          String?
+  tokenHash          String?    @unique // 장치 토큰 해시 (dvt_...)
+  pushTokenEncrypted String?
+  pushPlatform       String?
+  enrolledVehicleId  String?    // CAR 장치가 enroll 시 묶인 차량 (페어링 전 매핑)
+  lastSeenAt         DateTime?
+  revokedAt          DateTime?
+  createdAt          DateTime   @default(now())
+  user               User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  vehicleLinks      VehicleLink[]
+  pairingChallenges PairingChallenge[]
+  tripSyncs         TripSync[]
+  capabilityReports CapabilityReport[]
+  sensorBindings    SensorBinding[]
+
+  @@index([userId])
+}
+
+enum Powertrain {
+  EV
+  ICE
+  HEV
+  PHEV
+  UNKNOWN
+}
+
+model Vehicle {
+  id          String     @id @default(uuid())
+  displayName String
+  powertrain  Powertrain @default(UNKNOWN)
+  modelYear   Int?
+  source      String     @default("USER") // USER | PLEOS
+  createdAt   DateTime   @default(now())
+
+  links             VehicleLink[]
+  trips             Trip[]
+  capabilityReports CapabilityReport[]
+  telemetry         TelemetrySample[]
+  sleepSessions     SleepSession[]
+  commands          Command[]
+  stateCache        VehicleStateCache?
+}
+
+enum LinkRole {
+  OWNER
+  CAR_DEVICE
+  PHONE_DEVICE
+}
+
+enum LinkStatus {
+  PENDING
+  ACTIVE
+  REVOKED
+}
+
+model VehicleLink {
+  id        String     @id @default(uuid())
+  userId    String
+  vehicleId String
+  deviceId  String
+  role      LinkRole
+  status    LinkStatus @default(PENDING)
+  createdAt DateTime   @default(now())
+  revokedAt DateTime?
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicle   Vehicle    @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  device    Device     @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, vehicleId, deviceId])
+  @@index([vehicleId])
+  @@index([deviceId])
+}
+
+model PairingChallenge {
+  id          String    @id @default(uuid())
+  carDeviceId String
+  vehicleId   String
+  secretHash  String    @unique
+  expiresAt   DateTime
+  claimedBy   String? // userId
+  claimedAt   DateTime?
+  confirmedAt DateTime?
+  usedAt      DateTime?
+  createdAt   DateTime  @default(now())
+  carDevice   Device    @relation(fields: [carDeviceId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+enum ConsentDecision {
+  GRANTED
+  DENIED
+  WITHDRAWN
+}
+
+model ConsentEvent {
+  id            String          @id @default(uuid())
+  userId        String
+  purpose       String // e.g. LOCATION, CONTACTS, EXTERNAL_AI, SENSOR
+  policyVersion String
+  decision      ConsentDecision
+  occurredAt    DateTime        @default(now())
+  deviceId      String?
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose, occurredAt])
+}
+
+model EmergencyContact {
+  id             String   @id @default(uuid())
+  userId         String
+  nameEncrypted  String
+  phoneEncrypted String
+  priority       Int
+  version        Int      @default(1)
+  createdAt      DateTime @default(now())
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, priority])
+}
+
+// ─── 콘텐츠 ────────────────────────────────────────────────────────
+
+enum PermitStatus {
+  ALLOWED
+  PROHIBITED
+  CONDITIONAL
+  UNKNOWN
+}
+
+model Place {
+  id            String       @id @default(uuid())
+  providerId    String       @unique
+  name          String
+  lat           Float
+  lng           Float
+  campingStatus PermitStatus @default(UNKNOWN)
+  cookingStatus PermitStatus @default(UNKNOWN)
+  sourceUrl     String?
+  verifiedAt    DateTime?
+  meta          Json?
+  trips         Trip[]
+  reviews       Review[]
+}
+
+enum Visibility {
+  PRIVATE
+  PUBLIC
+}
+
+model Review {
+  id         String     @id @default(uuid())
+  userId     String
+  tripId     String     @unique
+  placeId    String
+  rating     Int
+  text       String
+  version    Int        @default(1)
+  visibility Visibility @default(PRIVATE)
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trip       Trip       @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  place      Place      @relation(fields: [placeId], references: [id])
+
+  @@index([placeId, visibility])
+}
+
+model WeatherSnapshot {
+  id          String   @id @default(uuid())
+  provider    String
+  issuedAt    DateTime
+  validFrom   DateTime
+  validTo     DateTime
+  region      String
+  payloadHash String
+  payload     Json
+  createdAt   DateTime @default(now())
+
+  @@index([region, validFrom, validTo])
+}
+
+// ─── 예약·세션 ─────────────────────────────────────────────────────
+
+enum TripStatus {
+  PLANNED
+  ACTIVE
+  DONE
+  CANCELLED
+}
+
+model Trip {
+  id        String     @id @default(uuid())
+  userId    String
+  vehicleId String
+  placeId   String
+  startAt   DateTime
+  endAt     DateTime
+  timezone  String
+  people    Int
+  status    TripStatus @default(PLANNED)
+  version   Int        @default(1)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vehicle   Vehicle    @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  place     Place      @relation(fields: [placeId], references: [id])
+
+  syncs         TripSync[]
+  powerPlans    PowerPlan[]
+  sleepSessions SleepSession[]
+  review        Review?
+
+  @@index([vehicleId, startAt])
+  @@index([userId, startAt])
+}
+
+model TripSync {
+  tripId         String
+  deviceId       String
+  appliedVersion Int
+  appliedAt      DateTime @default(now())
+  trip           Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  device         Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@id([tripId, deviceId])
+}
+
+model CapabilityReport {
+  id              String   @id @default(uuid())
+  vehicleId       String
+  deviceId        String
+  revision        Int
+  sdkVersion      String
+  serviceVersion  String?
+  emulatorVersion String?
+  permissions     Json
+  features        Json // Capability[]
+  observedAt      DateTime
+  createdAt       DateTime @default(now())
+  vehicle         Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  device          Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([vehicleId, revision])
+}
+
+model PowerPlan {
+  id             String   @id @default(uuid())
+  tripId         String?
+  inputs         Json
+  assumptions    Json
+  estimateMinKwh Float
+  estimateMaxKwh Float
+  reserveKwh     Float
+  confidence     String
+  modelVersion   String
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+  trip           Trip?    @relation(fields: [tripId], references: [id], onDelete: SetNull)
+}
+
+enum ExecutionMode {
+  MOCK
+  PLEOS_EMULATOR
+  REAL
+}
+
+enum SessionStatus {
+  PLANNED
+  PREFLIGHT
+  ACTIVE
+  STOPPED
+  FAILED
+}
+
+model SleepSession {
+  id                 String        @id @default(uuid())
+  tripId             String
+  vehicleId          String
+  status             SessionStatus @default(PLANNED)
+  planVersion        Int           @default(1)
+  capabilityRevision Int?
+  executionMode      ExecutionMode @default(MOCK)
+  startedAt          DateTime?
+  endedAt            DateTime?
+  endReason          String?
+  createdAt          DateTime      @default(now())
+  trip               Trip          @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  vehicle            Vehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  planVersions SleepPlanVersion[]
+  preflights   Preflight[]
+  telemetry    TelemetrySample[]
+  commands     Command[]
+  alerts       Alert[]
+
+  @@index([vehicleId, status])
+}
+
+model SleepPlanVersion {
+  sessionId   String
+  version     Int
+  desiredPlan Json
+  createdBy   String
+  createdAt   DateTime     @default(now())
+  session     SleepSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@id([sessionId, version])
+}
+
+model Preflight {
+  id            String       @id @default(uuid())
+  sessionId     String
+  stateRevision Int
+  readiness     String // READY | BLOCKED
+  blockers      Json
+  expiresAt     DateTime
+  createdAt     DateTime     @default(now())
+  session       SleepSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+}
+
+model SensorBinding {
+  id                 String    @id @default(uuid())
+  deviceId           String
+  sensorType         String
+  protocolVersion    String?
+  calibratedAt       DateTime?
+  expectedIntervalMs Int       @default(5000)
+  lastSeenAt         DateTime?
+  device             Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, sensorType])
+}
+
+enum Source {
+  PLEOS
+  BLE_SENSOR
+  USER
+  MOCK
+}
+
+enum Quality {
+  VALID
+  STALE
+  UNKNOWN
+  INVALID
+}
+
+model TelemetrySample {
+  id             String        @id @default(uuid())
+  vehicleId      String
+  sessionId      String?
+  metric         String // co2Ppm | coPpm | oxygenPct | cabinTempC | evSocPct | doorLock.* | window.* | fan | recirculation ...
+  value          Json? // number | string | boolean | null
+  unit           String
+  source         Source
+  sourceDeviceId String
+  observedAt     DateTime
+  receivedAt     DateTime      @default(now())
+  seq            Int
+  bootId         String
+  quality        Quality       @default(VALID)
+  vehicle        Vehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  session        SleepSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@unique([sourceDeviceId, bootId, seq, metric])
+  @@index([vehicleId, metric, observedAt(sort: Desc)])
+  @@index([sessionId, observedAt])
+}
+
+// 차량별 metric 최신값 캐시 — GET /vehicles/:id/state 용
+model VehicleStateCache {
+  vehicleId String   @id
+  revision  Int      @default(0)
+  metrics   Json // { [metric]: Observation }
+  updatedAt DateTime @updatedAt
+  vehicle   Vehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+}
+
+// ─── 명령 ──────────────────────────────────────────────────────────
+
+enum CommandStatus {
+  REQUESTED
+  QUEUED
+  DISPATCHED
+  ACCEPTED
+  VERIFYING
+  VERIFIED
+  REJECTED
+  FAILED
+  EXPIRED
+  CANCELLED
+  UNCONFIRMED
+}
+
+model Command {
+  id               String        @id @default(uuid())
+  vehicleId        String
+  sessionId        String?
+  action           Json
+  payloadHash      String
+  mode             ExecutionMode
+  status           CommandStatus @default(REQUESTED)
+  expiresAt        DateTime
+  requestedBy      String
+  userActionId     String
+  expectedRevision Int
+  capabilityRev    Int
+  observed         Json?
+  reason           String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  vehicle          Vehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  session          SleepSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  attempts         CommandAttempt[]
+
+  @@index([vehicleId, status])
+}
+
+model CommandAttempt {
+  id         String    @id @default(uuid())
+  commandId  String
+  attemptNo  Int
+  phase      String
+  result     String?
+  error      String?
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  command    Command   @relation(fields: [commandId], references: [id], onDelete: Cascade)
+
+  @@unique([commandId, attemptNo])
+}
+
+// ─── 경보·전송 ─────────────────────────────────────────────────────
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum AlertStatus {
+  RAISED
+  ACKED
+  RESOLVED
+}
+
+model Alert {
+  id            String        @id @default(uuid())
+  sessionId     String?
+  kind          String // SENSOR_DISCONNECTED | CO2_HIGH | CO_DETECTED | ACCESS_DETECTED(DEMO) | HEAVY_RAIN | VEHICLE_OFFLINE | ...
+  severity      AlertSeverity
+  sourceEventId String
+  evidence      Json
+  executionMode ExecutionMode @default(MOCK)
+  status        AlertStatus   @default(RAISED)
+  raisedAt      DateTime      @default(now())
+  resolvedAt    DateTime?
+  session       SleepSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  acks          AlertAck[]
+  deliveries    Delivery[]
+
+  @@unique([sessionId, sourceEventId]) // 세션 단위 중복 제거
+  @@index([sessionId, raisedAt])
+}
+
+model AlertAck {
+  id        String   @id @default(uuid())
+  alertId   String
+  userId    String?
+  actor     String // USER | SYSTEM
+  action    String // OK | KNOWN_PERSON | REQUEST_HELP | SNOOZE
+  createdAt DateTime @default(now())
+  alert     Alert    @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+enum DeliveryChannel {
+  WSS
+  PUSH
+  SMS
+  LOCAL
+}
+
+enum DeliveryStage {
+  QUEUED
+  SENT
+  RECEIVED
+  DISPLAYED
+  USER_ACK
+  FAILED
+}
+
+model Delivery {
+  id                String          @id @default(uuid())
+  alertId           String
+  channel           DeliveryChannel
+  recipientRef      String
+  status            DeliveryStage   @default(QUEUED)
+  providerMessageId String?
+  retryCount        Int             @default(0)
+  lastError         String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  alert             Alert           @relation(fields: [alertId], references: [id], onDelete: Cascade)
+
+  @@index([alertId, channel])
+}
+
+// ─── 인프라 ────────────────────────────────────────────────────────
+
+model OutboxEvent {
+  id          String    @id @default(uuid())
+  eventId     String    @unique
+  aggregateId String
+  type        String
+  version     Int
+  payload     Json
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([processedAt, createdAt])
+  @@index([aggregateId, version])
+}
+
+model InboxEvent {
+  eventId        String   @id
+  sourceDeviceId String
+  type           String
+  receivedAt     DateTime @default(now())
+}
+
+model IdempotencyRecord {
+  principal   String
+  route       String
+  key         String
+  requestHash String
+  statusCode  Int
+  response    Json
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@id([principal, route, key])
+  @@index([expiresAt])
+}
+
+model AuditEvent {
+  id         String   @id @default(uuid())
+  actor      String
+  action     String
+  target     String
+  result     String
+  requestId  String
+  occurredAt DateTime @default(now())
+
+  @@index([target, occurredAt])
+}
