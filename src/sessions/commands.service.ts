@@ -32,6 +32,7 @@ const ALLOWLIST: Record<'MOCK' | 'PLEOS_EMULATOR' | 'REAL', string[]> = {
   REAL: [],
 };
 
+const MAX_COMMAND_TTL_MS = 10 * 60_000;
 const ACTION_DTO: Record<string, new () => object> = { SET_CLIMATE_TARGET: SetClimateTargetAction, REQUEST_FRESH_AIR: RequestFreshAirAction, LOCK_DOOR: LockDoorAction };
 
 @Injectable()
@@ -47,6 +48,8 @@ export class CommandsService {
     const bad = validateSync(plainToInstance(ACTION_DTO[type], dto.action), { whitelist: true, forbidNonWhitelisted: true });
     if (bad.length) throw new ApiError('VALIDATION_FAILED', `invalid ${type} fields`, bad.map((e) => e.property));
     if (Date.parse(dto.expiresAt) <= Date.now()) throw new ApiError('VALIDATION_FAILED', 'expiresAt already passed');
+    // 오프라인 차량이 몇 시간 뒤 재접속해 옛 제어를 실행하지 않도록 상한을 둔다
+    if (Date.parse(dto.expiresAt) > Date.now() + MAX_COMMAND_TTL_MS) throw new ApiError('VALIDATION_FAILED', `expiresAt must be within ${MAX_COMMAND_TTL_MS / 60_000} minutes`);
 
     if (dto.sessionId) {
       const s = await this.access.assertSession(p, dto.sessionId);

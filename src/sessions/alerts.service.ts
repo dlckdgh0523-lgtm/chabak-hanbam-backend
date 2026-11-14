@@ -22,7 +22,13 @@ export class AlertsService implements OnModuleInit {
     this.staleMs = Number(cfg.get('SENSOR_STALE_AFTER_MS') ?? 15000);
   }
 
-  onModuleInit() {
+  async onModuleInit() {
+    // 재시작하면 메모리 감시 목록이 비어, 자는 중 이미 죽은 센서는 영원히 단절 경보가 안 난다 → ACTIVE 세션의 CO/CO₂ 를 지금 기준으로 다시 감시
+    const active = await this.prisma.sleepSession.findMany({ where: { status: 'ACTIVE' }, select: { id: true, vehicleId: true } });
+    for (const s of active) {
+      const cache = await this.prisma.vehicleStateCache.findUnique({ where: { vehicleId: s.vehicleId }, select: { metrics: true } });
+      for (const m of ['co2Ppm', 'coPpm']) if ((cache?.metrics as Record<string, unknown> | undefined)?.[m]) this.lastSeen.set(`${s.vehicleId}:${m}`, { at: Date.now(), sessionId: s.id });
+    }
     this.events.bus.on('telemetry', (e: { vehicleId: string; sessionId?: string; metrics: Record<string, Observation>; deviceId: string }) => void this.onTelemetry(e));
     setInterval(() => void this.sweepDisconnected(), 5000);
   }
