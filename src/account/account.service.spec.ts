@@ -155,6 +155,13 @@ describe('AccountService', () => {
       expect(JSON.stringify(res)).not.toContain('1234');
     });
 
+    // [백엔드 추가] 하이픈 없이 저장한 번호도 하이픈 있는 번호와 같은 모양으로 보여 준다 (화면마다 형식이 섞이지 않게)
+    it('2. 하이픈 없는 국내 휴대폰 번호도 ***-****-1234 형식으로 보여준다', async () => {
+      await service.putContacts('user-1', [{ name: 'a', phone: '01099998888' }, { name: 'b', phone: '0161234567' }], 0);
+      const res = await service.getContacts('user-1');
+      expect(res.contacts.map((c) => c.maskedPhone)).toEqual(['***-****-8888', '***-***-4567']);
+    });
+
     // 의도: 연락처 조회가 userId 로 제한되는지.
     it('다른 사용자의 연락처는 보이지 않는다', async () => {
       await service.putContacts('user-1', [{ name: '엄마', phone: '01012345678' }], 0);

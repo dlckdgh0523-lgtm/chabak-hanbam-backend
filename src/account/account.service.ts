@@ -31,6 +31,8 @@ export class AccountService {
     return Buffer.concat([d.update(ct), d.final()]).toString('utf8');
   }
   private mask(phone: string) {
+    // 하이픈 없이 저장한 국내 휴대폰 번호도 같은 모양(***-****-1234)으로 보이게
+    if (/^01\d{8,9}$/.test(phone)) phone = phone.replace(/^(\d{3})(\d{3,4})(\d{4})$/, '$1-$2-$3');
     const digits = phone.replace(/\D/g, '');
     let keep = Math.max(0, digits.length - 4), i = 0;
     return phone.replace(/\d/g, (c) => (i++ < keep ? '*' : c));
