@@ -1,5 +1,4 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { PrismaService } from '../prisma/prisma.service';
@@ -45,7 +44,7 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
   private readonly bootId = randomUUID();
   private seq = 0;
 
-  constructor(private readonly prisma: PrismaService, private readonly cfg: ConfigService) {}
+  constructor(private readonly prisma: PrismaService) {}
 
   onModuleInit() {
     this.timer = setInterval(() => void this.drain(), 250);

@@ -13,8 +13,9 @@ class ConsentDto {
 }
 
 class ContactDto {
+  @IsOptional() @IsString() id?: string; // phone 생략 시 이 연락처의 기존 번호 유지
   @IsString() @Length(1, 40) name: string;
-  @IsString() @Matches(/^\+?[0-9\-]{7,20}$/) phone: string;
+  @IsOptional() @IsString() @Matches(/^\+?[0-9\-]{7,20}$/) phone?: string;
 }
 class PutContactsDto {
   @IsArray() @ArrayMaxSize(3) @ValidateNested({ each: true }) @Type(() => ContactDto) contacts: ContactDto[];

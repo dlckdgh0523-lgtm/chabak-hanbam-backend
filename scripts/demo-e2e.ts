@@ -196,11 +196,14 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   console.log('\n[13] 연락처·문자(사용자 명시 요청만)');
   const cv = (await call('GET', '/emergency-contacts', USER)).body.version as number;
   const c0 = await call('PUT', '/emergency-contacts', USER, { expectedVersion: cv, contacts: [{ name: '엄마', phone: '010-1234-5678' }] });
-  ok('contacts saved, phone masked', c0.status === 200 && c0.body.contacts[0].phoneMasked.includes('*'), c0.body);
+  ok('contacts saved, phone masked', c0.status === 200 && c0.body.contacts[0].maskedPhone.includes('*'), c0.body);
+  const c1 = await call('PUT', '/emergency-contacts', USER, { expectedVersion: c0.body.version, contacts: [{ id: c0.body.contacts[0].id, name: '어머니' }] });
+  ok('rename without phone keeps number', c1.status === 200 && c1.body.contacts[0].maskedPhone === c0.body.contacts[0].maskedPhone, c1.body);
+  ok('new contact without phone → 400', (await call('PUT', '/emergency-contacts', USER, { expectedVersion: c1.body.version, contacts: [{ name: '친구' }] })).status === 400);
   ok('contacts stale version → 409', (await call('PUT', '/emergency-contacts', USER, { expectedVersion: cv, contacts: [] })).status === 409);
-  const sms = await call('POST', `/alerts/${acc.body.alertId}/contact-notifications`, USER, { recipients: [c0.body.contacts[0].id], template: 'ACCESS_HELP', userActionId: 'ua5' }, idem());
+  const sms = await call('POST', `/alerts/${acc.body.alertId}/contact-notifications`, USER, { recipients: [c1.body.contacts[0].id], template: 'ACCESS_HELP', userActionId: 'ua5' }, idem());
   ok('sms job 202', sms.status === 202, sms.body);
-  ok('sms rate-limited within 5min → 429', (await call('POST', `/alerts/${acc.body.alertId}/contact-notifications`, USER, { recipients: [c0.body.contacts[0].id], template: 'ACCESS_HELP', userActionId: 'ua6' }, idem())).status === 429);
+  ok('sms rate-limited within 5min → 429', (await call('POST', `/alerts/${acc.body.alertId}/contact-notifications`, USER, { recipients: [c1.body.contacts[0].id], template: 'ACCESS_HELP', userActionId: 'ua6' }, idem())).status === 429);
 
   console.log('\n[14] 센서 단절 (15초 대기)');
   ok('demo SENSOR_DROP', (await call('POST', '/demo/scenarios', CAR, { vehicleId, sessionId: sid, scenario: 'SENSOR_DROP' })).status === 201);

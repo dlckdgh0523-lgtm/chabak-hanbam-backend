@@ -1,7 +1,7 @@
 import { CallHandler, ExecutionContext, Injectable, NestInterceptor, SetMetadata } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { createHash } from 'crypto';
-import { Observable, from, of, switchMap, tap } from 'rxjs';
+import { Observable, concatMap, from, map, of, switchMap } from 'rxjs';
 import { PrismaService } from '../prisma/prisma.service';
 import { ApiError } from './errors';
 import { principalKey } from '../auth/principal';
@@ -37,14 +37,18 @@ export class IdempotencyInterceptor implements NestInterceptor {
           res.setHeader('idempotent-replayed', 'true');
           return of(rec.response);
         }
+        // 기록을 응답 전에 끝내야 즉시 재시도가 replay 된다.
+        // shortcut: 완전히 동시에 도착한 두 요청은 둘 다 실행될 수 있음, 실차 명령 연결 시 선점(reserve) 레코드로 교체.
         return next.handle().pipe(
-          tap((body) => {
-            void this.prisma.idempotencyRecord
-              .create({
-                data: { principal, route, key, requestHash, statusCode: res.statusCode, response: body ?? {}, expiresAt: new Date(Date.now() + TTL_MS) },
-              })
-              .catch(() => undefined); // 동시 요청 race: 첫 기록만 남는다
-          }),
+          concatMap((body) =>
+            from(
+              this.prisma.idempotencyRecord
+                .create({
+                  data: { principal, route, key, requestHash, statusCode: res.statusCode, response: body ?? {}, expiresAt: new Date(Date.now() + TTL_MS) },
+                })
+                .catch(() => undefined), // 동시 요청 race: 첫 기록만 남는다
+            ).pipe(map(() => body)),
+          ),
         );
       }),
     );

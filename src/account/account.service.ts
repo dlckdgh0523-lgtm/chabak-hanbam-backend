@@ -45,17 +45,20 @@ export class AccountService {
   async getContacts(userId: string) {
     const rows = await this.prisma.emergencyContact.findMany({ where: { userId }, orderBy: { priority: 'asc' } });
     const version = rows.reduce((m, r) => Math.max(m, r.version), 0);
-    return { version, contacts: rows.map((r) => ({ id: r.id, priority: r.priority, name: this.dec(r.nameEncrypted), phoneMasked: this.mask(this.dec(r.phoneEncrypted)) })) };
+    return { version, contacts: rows.map((r) => ({ id: r.id, priority: r.priority, name: this.dec(r.nameEncrypted), maskedPhone: this.mask(this.dec(r.phoneEncrypted)) })) };
   }
 
-  async putContacts(userId: string, contacts: { name: string; phone: string }[], expectedVersion: number) {
+  async putContacts(userId: string, contacts: { id?: string; name: string; phone?: string }[], expectedVersion: number) {
     const current = await this.getContacts(userId);
     if (current.version !== expectedVersion) throw new ApiError('VERSION_CONFLICT', `expectedVersion ${expectedVersion} != ${current.version}`);
+    const old = new Map((await this.prisma.emergencyContact.findMany({ where: { userId } })).map((r) => [r.id, r.phoneEncrypted]));
+    const phones = contacts.map((c) => (c.phone !== undefined ? this.enc(c.phone) : old.get(c.id ?? '')));
+    if (phones.some((p) => p === undefined)) throw new ApiError('VALIDATION_FAILED', 'phone required for new contact');
     const version = expectedVersion + 1;
     await this.prisma.$transaction(async (tx) => {
       await tx.emergencyContact.deleteMany({ where: { userId } });
       for (let i = 0; i < contacts.length; i++) {
-        await tx.emergencyContact.create({ data: { userId, priority: i + 1, nameEncrypted: this.enc(contacts[i].name), phoneEncrypted: this.enc(contacts[i].phone), version } });
+        await tx.emergencyContact.create({ data: { userId, priority: i + 1, nameEncrypted: this.enc(contacts[i].name), phoneEncrypted: phones[i]!, version } });
       }
     });
     return this.getContacts(userId);
