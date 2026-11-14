@@ -7,7 +7,9 @@ import { EventsService } from '../events/events.service';
 import { VehiclesService } from '../vehicles/vehicles.service';
 import { ApiError, notFound } from '../common/errors';
 import { DevicePrincipal, Principal, UserPrincipal } from '../auth/principal';
-import { CommandRequestDto, CommandResultDto } from './sessions.dto';
+import { plainToInstance } from 'class-transformer';
+import { validateSync } from 'class-validator';
+import { CommandRequestDto, CommandResultDto, LockDoorAction, RequestFreshAirAction, SetClimateTargetAction } from './sessions.dto';
 
 /**
  * REQUESTED → QUEUED → DISPATCHED → ACCEPTED → VERIFYING → VERIFIED
@@ -30,6 +32,8 @@ const ALLOWLIST: Record<'MOCK' | 'PLEOS_EMULATOR' | 'REAL', string[]> = {
   REAL: [],
 };
 
+const ACTION_DTO: Record<string, new () => object> = { SET_CLIMATE_TARGET: SetClimateTargetAction, REQUEST_FRESH_AIR: RequestFreshAirAction, LOCK_DOOR: LockDoorAction };
+
 @Injectable()
 export class CommandsService {
   private readonly log = new Logger(CommandsService.name);
@@ -40,6 +44,8 @@ export class CommandsService {
     if (process.env.NODE_ENV === 'production' && dto.executionMode === 'MOCK') throw new ApiError('FORBIDDEN', 'MOCK commands rejected in production');
     const type = dto.action?.type;
     if (!ALLOWLIST[dto.executionMode].includes(type)) throw new ApiError('UNSUPPORTED_CAPABILITY', `action ${type} not in ${dto.executionMode} allowlist`, { allowlist: ALLOWLIST[dto.executionMode] });
+    const bad = validateSync(plainToInstance(ACTION_DTO[type], dto.action));
+    if (bad.length) throw new ApiError('VALIDATION_FAILED', `invalid ${type} fields`, bad.map((e) => e.property));
     if (Date.parse(dto.expiresAt) <= Date.now()) throw new ApiError('VALIDATION_FAILED', 'expiresAt already passed');
 
     if (dto.sessionId) {
@@ -50,7 +56,8 @@ export class CommandsService {
     // 사전검사: 차량 온라인, capability 범위
     const state = await this.vehicles.getState(p, vehicleId);
     if (state.connection !== 'ONLINE') throw new ApiError('PRECONDITION_FAILED', 'vehicle offline');
-    if (dto.expectedStateRevision !== state.revision) throw new ApiError('PRECONDITION_FAILED', `expectedStateRevision ${dto.expectedStateRevision} != ${state.revision}`);
+    // 취침 중 센서 업로드로 revision 은 계속 오른다 → 클라이언트가 서버보다 앞선 값만 거부 (8.1-6)
+    if (dto.expectedStateRevision > state.revision) throw new ApiError('PRECONDITION_FAILED', `expectedStateRevision ${dto.expectedStateRevision} > ${state.revision}`);
     const caps = await this.vehicles.getCapabilities(p, vehicleId);
     if (dto.capabilityRevision !== caps.revision) throw new ApiError('PRECONDITION_FAILED', `capabilityRevision ${dto.capabilityRevision} != ${caps.revision}`);
     this.validateAgainstCapability(dto.action, (caps.features ?? []) as never, dto.executionMode);
@@ -97,7 +104,7 @@ export class CommandsService {
     const c = await this.prisma.command.findUnique({ where: { id } });
     if (!c) throw notFound('command');
     await this.access.assertVehicle(p, c.vehicleId);
-    if (c.expiresAt < new Date() && !['VERIFIED', 'FAILED', 'REJECTED'].includes(dto.status)) {
+    if (TRANSITIONS[c.status].length && c.expiresAt < new Date() && !['VERIFIED', 'FAILED', 'REJECTED'].includes(dto.status)) {
       await this.transition(id, 'EXPIRED', { attemptNo: dto.attemptNo, phase: 'EXPIRED', error: 'result after expiry' });
       return { commandId: id, status: 'EXPIRED' };
     }

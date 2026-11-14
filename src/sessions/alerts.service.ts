@@ -90,8 +90,10 @@ export class AlertsService implements OnModuleInit {
     const s = await this.access.assertSession(p, a.sessionId);
     const ack = await this.prisma.alertAck.create({ data: { alertId, userId: p.kind === 'USER' ? p.userId : null, actor: p.kind === 'USER' ? 'USER' : 'SYSTEM', action } });
     // 사람이 한 응답만 ACKED. 경보 해제(RESOLVED)는 새 정상 관측 + 정책 — 여기서 자동 해제하지 않는다.
-    if (p.kind === 'USER') await this.prisma.alert.update({ where: { id: alertId }, data: { status: 'ACKED' } });
-    await this.prisma.delivery.updateMany({ where: { alertId }, data: { status: 'USER_ACK' } });
+    if (p.kind === 'USER') {
+      await this.prisma.alert.update({ where: { id: alertId }, data: { status: 'ACKED' } });
+      await this.prisma.delivery.updateMany({ where: { alertId }, data: { status: 'USER_ACK' } });
+    }
     this.events.publish({ type: 'ALERT_ACKED', aggregateId: s.vehicleId, executionMode: s.executionMode, payload: { alertId, action, actor: ack.actor } });
     return { alertId, action, status: p.kind === 'USER' ? 'ACKED' : a.status };
   }

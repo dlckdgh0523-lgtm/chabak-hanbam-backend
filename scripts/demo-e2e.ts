@@ -116,6 +116,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   ok('patch stale version → 409', (await call('PATCH', `/trips/${trip.body.id}`, USER, { expectedVersion: 99, people: 1 })).status === 409);
   const patched = await call('PATCH', `/trips/${trip.body.id}`, USER, { expectedVersion: 1, people: 1 });
   ok('patch v1→v2, vehicle STALE(v1)', patched.body.version === 2 && patched.body.sync.vehicle === 'STALE(v1)', patched.body.sync);
+  ok('patch endAt before startAt → 400', (await call('PATCH', `/trips/${trip.body.id}`, USER, { expectedVersion: 2, endAt: `${tomorrow}T11:00:00Z` })).status === 400);
 
   console.log('\n[9] 브리핑·비교·전력·일출');
   const br = await call('GET', `/places/${place.id}/briefing`, USER);
@@ -149,8 +150,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   ok('preflight READY with WARN only (CO unmeasured, hvac write denied in MOCK)', pf2.body.readiness === 'READY' && pf2.body.blockers.every((b: any) => b.severity === 'WARN'), pf2.body.blockers);
   const pp1 = await call('POST', '/power-plans', USER, { vehicleId, tripId: trip.body.id, nightHours: 9, people: 2, targetTempC: 20, outsideTempC: 4, returnDistanceKm: 45 });
   ok('power-plan with SOC 72% → OK/MARGINAL', ['OK', 'MARGINAL'].includes(pp1.body.verdict), pp1.body);
+  ok('sensor upload after preflight (revision bump)', (await call('POST', '/demo/scenarios', CAR, { vehicleId, sessionId: sid, scenario: 'DOORS_SECURED' })).status === 201);
   const start = await call('POST', `/sleep-sessions/${sid}/start`, USER, { preflightId: pf2.body.preflightId, planVersion: 1, userConfirmed: true, userActionId: 'ua2' });
   ok('session ACTIVE', start.status === 200 && start.body.status === 'ACTIVE', start.body);
+  ok('start again → 422 (one ACTIVE per vehicle)', (await call('POST', `/sleep-sessions/${sid}/start`, USER, { preflightId: pf2.body.preflightId, planVersion: 1, userConfirmed: true, userActionId: 'ua2b' })).status === 422);
 
   console.log('\n[11] 명령 상태기계 + allowlist');
   st = await call('GET', `/vehicles/${vehicleId}/state`, USER);
@@ -161,6 +164,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   ok('EMULATOR with writeAllowed=false → 422', cmdEmu.status === 422, cmdEmu.body);
   const cmd = await call('POST', `/vehicles/${vehicleId}/commands`, USER, { sessionId: sid, action: { type: 'REQUEST_FRESH_AIR', fanLevel: 3 }, expectedStateRevision: st.body.revision, capabilityRevision: 1, expiresAt: expires, userActionId: 'ua4', executionMode: 'MOCK' }, idem());
   ok('MOCK command DISPATCHED', cmd.status === 202 && cmd.body.status === 'DISPATCHED', cmd.body);
+  ok('command field type checked → 400', (await call('POST', `/vehicles/${vehicleId}/commands`, USER, { sessionId: sid, action: { type: 'SET_CLIMATE_TARGET', targetTempC: 'abc', areaId: 'ROW_1_LEFT' }, expectedStateRevision: st.body.revision, capabilityRevision: 1, expiresAt: expires, userActionId: 'ua4b', executionMode: 'MOCK' }, idem())).status === 400);
+  ok('older expectedStateRevision still accepted', (await call('POST', `/vehicles/${vehicleId}/commands`, USER, { sessionId: sid, action: { type: 'REQUEST_FRESH_AIR', fanLevel: 2 }, expectedStateRevision: st.body.revision - 1, capabilityRevision: 1, expiresAt: expires, userActionId: 'ua4c', executionMode: 'MOCK' }, idem())).status === 202);
   const cid = cmd.body.commandId;
   ok('illegal transition DISPATCHED→VERIFIED → 422', (await call('POST', `/commands/${cid}/results`, CAR, { status: 'VERIFIED', attemptNo: 1 })).status === 422);
   ok('ACCEPTED', (await call('POST', `/commands/${cid}/results`, CAR, { status: 'ACCEPTED', attemptNo: 1 })).body.status === 'ACCEPTED');
@@ -205,6 +210,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   ok('sms job 202', sms.status === 202, sms.body);
   ok('sms rate-limited within 5min → 429', (await call('POST', `/alerts/${acc.body.alertId}/contact-notifications`, USER, { recipients: [c1.body.contacts[0].id], template: 'ACCESS_HELP', userActionId: 'ua6' }, idem())).status === 429);
 
+  const s1 = await call('POST', `/vehicles/${vehicleId}/sensor-tokens`, USER);
+  const s2 = await call('POST', `/vehicles/${vehicleId}/sensor-tokens`, USER);
+  ok('sensor token reissue revokes previous → 401', (await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, s1.body.deviceToken, {})).status === 401 && (await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, s2.body.deviceToken, {})).status !== 401);
+
   console.log('\n[14] 센서 단절 (15초 대기)');
   ok('demo SENSOR_DROP', (await call('POST', '/demo/scenarios', CAR, { vehicleId, sessionId: sid, scenario: 'SENSOR_DROP' })).status === 201);
   await sleep(21_000);
@@ -220,6 +229,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   ok('summary marks missing coverage, not normal', sum.status === 200 && sum.body.coverage.coPpm !== '연속 기록' && sum.body.disclaimer, sum.body.coverage);
   const review = await call('POST', '/reviews', USER, { tripId: trip.body.id, rating: 4, text: '조용했음' });
   ok('review PRIVATE by default', review.body.visibility === 'PRIVATE');
+  ok('second review same trip → 409', (await call('POST', '/reviews', USER, { tripId: trip.body.id, rating: 5, text: '또' })).status === 409);
 
   console.log('\n[16] WSS 이벤트 수신 확인');
   const types = new Set(events.map((e) => e.type));

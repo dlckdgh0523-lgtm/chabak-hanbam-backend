@@ -45,6 +45,8 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
       if (!link) return this.reject(ws, 4403, 'no access to vehicle room');
 
       this.clients.set(ws, { ws, principal: `${principal.kind}:${principal.id}`, rooms: new Set([vehicleId]) });
+      // 접속 후 JWT 가 만료되면 연결을 끊는다 (10.2-5)
+      if (principal.exp) setTimeout(() => this.reject(ws, 4401, 'token expired'), Math.max(0, principal.exp * 1000 - Date.now())).unref();
       ws.send(JSON.stringify({ type: 'HELLO', vehicleId, serverTime: new Date().toISOString() }));
 
       if (since) {
@@ -66,14 +68,16 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
     try { ws.close(code, reason); } catch { /* ignore */ }
   }
 
-  private async resolve(raw: string): Promise<{ kind: 'USER' | 'DEVICE'; id: string } | null> {
+  private async resolve(raw: string): Promise<{ kind: 'USER' | 'DEVICE'; id: string; exp?: number } | null> {
     if (!raw) return null;
     if (this.tokens.isDeviceToken(raw)) {
       const d = await this.prisma.device.findUnique({ where: { tokenHash: this.tokens.hash(raw) } });
       return d && !d.revokedAt ? { kind: 'DEVICE', id: d.id } : null;
     }
     const p = this.tokens.verifyUserAccess(raw);
-    return p ? { kind: 'USER', id: p.sub } : null;
+    if (!p) return null;
+    const u = await this.prisma.user.findUnique({ where: { id: p.sub }, select: { deletionRequestedAt: true } });
+    return u && !u.deletionRequestedAt ? { kind: 'USER', id: p.sub, exp: p.exp } : null;
   }
 
   private broadcast(env: Envelope) {

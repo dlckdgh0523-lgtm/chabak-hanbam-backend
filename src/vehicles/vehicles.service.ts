@@ -95,15 +95,19 @@ export class VehiclesService {
     }
 
     if (latest.size) {
-      // 늦게 온 과거 값이 최신 상태를 덮어쓰지 않게 metric 별 observedAt 비교
-      const cache = await this.prisma.vehicleStateCache.upsert({ where: { vehicleId }, create: { vehicleId, metrics: {} }, update: {} });
-      const metrics = { ...(cache.metrics as unknown as Record<string, Observation>) };
-      for (const [m, o] of latest) {
-        const cur = metrics[m];
-        if (!cur || Date.parse(cur.observedAt) <= Date.parse(o.observedAt)) metrics[m] = o;
-      }
-      const revision = cache.revision + 1;
-      await this.prisma.vehicleStateCache.update({ where: { vehicleId }, data: { metrics: metrics as unknown as Prisma.InputJsonValue, revision } });
+      // 늦게 온 과거 값이 최신 상태를 덮어쓰지 않게 metric 별 observedAt 비교. 락으로 동시 업로드끼리 서로의 metric 을 지우지 않는다.
+      const revision = await this.prisma.$transaction(async (tx) => {
+        await this.prisma.lockVehicle(tx, vehicleId);
+        const cache = await tx.vehicleStateCache.upsert({ where: { vehicleId }, create: { vehicleId, metrics: {} }, update: {} });
+        const metrics = { ...(cache.metrics as unknown as Record<string, Observation>) };
+        for (const [m, o] of latest) {
+          const cur = metrics[m];
+          if (!cur || Date.parse(cur.observedAt) <= Date.parse(o.observedAt)) metrics[m] = o;
+        }
+        const revision = cache.revision + 1;
+        await tx.vehicleStateCache.update({ where: { vehicleId }, data: { metrics: metrics as unknown as Prisma.InputJsonValue, revision } });
+        return revision;
+      });
       this.events.publish({
         type: 'STATE_SNAPSHOT', aggregateId: vehicleId, revision, sourceDeviceId: p.deviceId,
         executionMode: [...latest.values()].some((o) => o.source === 'MOCK') ? 'MOCK' : 'REAL',

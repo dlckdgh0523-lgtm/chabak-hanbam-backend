@@ -3,12 +3,12 @@ import { IsBoolean, IsIn, IsInt, IsISO8601, IsNumber, IsObject, IsOptional, IsSt
 
 export class SleepPlanDto {
   @IsBoolean() heatEnabled: boolean;
-  @IsOptional() @IsNumber() @Min(16) @Max(30) targetTempC: number | null; // UI 범위(events.json heating). capability 교집합은 서버가 다시 검사.
+  @IsOptional() @IsNumber() @Min(14) @Max(24) targetTempC: number | null; // UI 범위. capability 교집합은 서버가 다시 검사. capability 교집합은 서버가 다시 검사.
   @IsIn(['FRESH_AIR_REQUIRED']) ventilationPolicy: 'FRESH_AIR_REQUIRED'; // 목표 정책이며 측정 결과가 아님
   @IsBoolean() accessAlertEnabled: boolean;
   @IsISO8601() wakeAt: string;
   @IsString() timezone: string;
-  @IsInt() @Min(0) @Max(90) musicDurationMin: number;
+  @IsIn([0, 15, 30, 60]) musicDurationMin: 0 | 15 | 30 | 60;
 }
 
 export class CreateSessionDto {

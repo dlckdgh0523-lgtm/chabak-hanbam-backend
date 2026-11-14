@@ -94,8 +94,18 @@ export class AccountService {
     const link = await this.prisma.vehicleLink.findFirst({ where: { userId: p.userId, vehicleId, status: 'ACTIVE' } });
     if (!link) throw notFound('vehicle');
     const t = this.tokens.newDeviceToken();
-    const d = await this.prisma.device.create({ data: { userId: p.userId, type: 'SENSOR', displayName: 'phone-sensor', tokenHash: t.hash } });
-    await this.prisma.vehicleLink.create({ data: { userId: p.userId, vehicleId, deviceId: d.id, role: 'PHONE_DEVICE', status: 'ACTIVE' } });
+    const d = await this.prisma.$transaction(async (tx) => {
+      await this.prisma.lockVehicle(tx, vehicleId);
+      // 차량당 센서 1대: 다른 사용자가 발급한 센서도 폐기 (명세 4.3.2)
+      const old = await tx.vehicleLink.findMany({ where: { vehicleId, status: 'ACTIVE', device: { type: 'SENSOR' } }, select: { id: true, deviceId: true } });
+      if (old.length) {
+        await tx.vehicleLink.updateMany({ where: { id: { in: old.map((l) => l.id) } }, data: { status: 'REVOKED', revokedAt: new Date() } });
+        await tx.device.updateMany({ where: { id: { in: old.map((l) => l.deviceId) } }, data: { revokedAt: new Date(), tokenHash: null } });
+      }
+      const d = await tx.device.create({ data: { userId: p.userId, type: 'SENSOR', displayName: 'phone-sensor', tokenHash: t.hash } });
+      await tx.vehicleLink.create({ data: { userId: p.userId, vehicleId, deviceId: d.id, role: 'PHONE_DEVICE', status: 'ACTIVE' } });
+      return d;
+    });
     return { deviceId: d.id, deviceToken: t.raw, scope: 'sensor' as const };
   }
 

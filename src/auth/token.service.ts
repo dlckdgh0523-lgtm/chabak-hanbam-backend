@@ -23,9 +23,9 @@ export class TokenService {
     );
   }
 
-  verifyUserAccess(token: string): { sub: string; scope: string } | null {
+  verifyUserAccess(token: string): { sub: string; scope: string; exp?: number } | null {
     try {
-      return this.jwt.verify<{ sub: string; scope: string }>(token, { secret: this.cfg.getOrThrow("JWT_USER_SECRET") });
+      return this.jwt.verify<{ sub: string; scope: string; exp?: number }>(token, { secret: this.cfg.getOrThrow("JWT_USER_SECRET") });
     } catch {
       return null;
     }

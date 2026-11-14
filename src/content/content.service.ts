@@ -1,4 +1,5 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccessService } from '../auth/access.service';
 import { ApiError, notFound } from '../common/errors';
@@ -111,7 +112,10 @@ export class ContentService implements OnModuleInit {
   async createReview(p: UserPrincipal, dto: { tripId: string; rating: number; text: string }) {
     const t = await this.access.assertTrip(p, dto.tripId);
     // 밤 기록 자동 공개 금지 → PRIVATE 기본
-    return this.prisma.review.create({ data: { userId: p.userId, tripId: t.id, placeId: t.placeId, rating: dto.rating, text: dto.text } });
+    return this.prisma.review.create({ data: { userId: p.userId, tripId: t.id, placeId: t.placeId, rating: dto.rating, text: dto.text } }).catch((e: Prisma.PrismaClientKnownRequestError) => {
+      if (e.code === 'P2002') throw new ApiError('ALREADY_EXISTS', 'review already exists for this trip');
+      throw e;
+    });
   }
 
   async patchReview(p: UserPrincipal, id: string, dto: { text: string; expectedVersion: number }) {

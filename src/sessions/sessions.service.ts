@@ -51,16 +51,25 @@ export class SessionsService {
   /** 자동 관리 진입 검사. 사용자 자기확인(체크박스)과 구분. */
   async preflight(p: Principal, id: string, dto: PreflightDto) {
     const s = await this.access.assertSession(p, id);
-    const [state, caps, vehicle, trip, consents, planRow] = await Promise.all([
+    if (s.status === 'STOPPED' || s.status === 'FAILED') throw new ApiError('PRECONDITION_FAILED', `session is ${s.status}`);
+    const { state, caps, result } = await this.evaluate(p, s);
+    if (dto.stateRevision < state.revision) throw new ApiError('PRECONDITION_FAILED', `client stateRevision ${dto.stateRevision} < server ${state.revision}; refetch state`);
+    const pf = await this.prisma.preflight.create({
+      data: { sessionId: id, stateRevision: state.revision, readiness: result.readiness, blockers: result.blockers as unknown as Prisma.InputJsonValue, expiresAt: new Date(Date.now() + PREFLIGHT_TTL_MS) },
+    });
+    await this.prisma.sleepSession.update({ where: { id }, data: { status: s.status === 'PLANNED' ? 'PREFLIGHT' : s.status } });
+    return { preflightId: pf.id, readiness: result.readiness, blockers: result.blockers, stateRevision: state.revision, capabilityRevision: caps.revision, expiresAt: pf.expiresAt };
+  }
+
+  private async evaluate(p: Principal, s: { id: string; vehicleId: string; tripId: string; planVersion: number; executionMode: 'MOCK' | 'PLEOS_EMULATOR' | 'REAL' }) {
+    const trip = await this.prisma.trip.findUniqueOrThrow({ where: { id: s.tripId } });
+    const [state, caps, vehicle, consents, planRow] = await Promise.all([
       this.vehicles.getState(p, s.vehicleId),
       this.vehicles.getCapabilities(p, s.vehicleId),
       this.prisma.vehicle.findUniqueOrThrow({ where: { id: s.vehicleId } }),
-      this.prisma.trip.findUniqueOrThrow({ where: { id: s.tripId } }),
-      this.prisma.consentEvent.findMany({ where: { userId: (await this.prisma.trip.findUniqueOrThrow({ where: { id: s.tripId } })).userId }, orderBy: { occurredAt: 'asc' } }),
-      this.prisma.sleepPlanVersion.findUniqueOrThrow({ where: { sessionId_version: { sessionId: id, version: s.planVersion } } }),
+      this.prisma.consentEvent.findMany({ where: { userId: trip.userId }, orderBy: { occurredAt: 'asc' } }),
+      this.prisma.sleepPlanVersion.findUniqueOrThrow({ where: { sessionId_version: { sessionId: s.id, version: s.planVersion } } }),
     ]);
-    void trip;
-    if (dto.stateRevision < state.revision) throw new ApiError('PRECONDITION_FAILED', `client stateRevision ${dto.stateRevision} < server ${state.revision}; refetch state`);
 
     // 최신 동의 상태 계산 (append-only 이벤트에서 마지막 결정)
     const latestConsent = new Map<string, string>();
@@ -72,25 +81,29 @@ export class SessionsService {
       powertrain: vehicle.powertrain, connection: state.connection, metrics: state.metrics as Record<string, Observation>,
       plan: { heatEnabled: plan.heatEnabled, targetTempC: plan.targetTempC }, capabilities: (caps.features ?? []) as never, consents: granted, executionMode: s.executionMode,
     });
-    const pf = await this.prisma.preflight.create({
-      data: { sessionId: id, stateRevision: state.revision, readiness: result.readiness, blockers: result.blockers as unknown as Prisma.InputJsonValue, expiresAt: new Date(Date.now() + PREFLIGHT_TTL_MS) },
-    });
-    await this.prisma.sleepSession.update({ where: { id }, data: { status: s.status === 'PLANNED' ? 'PREFLIGHT' : s.status } });
-    return { preflightId: pf.id, readiness: result.readiness, blockers: result.blockers, stateRevision: state.revision, capabilityRevision: caps.revision, expiresAt: pf.expiresAt };
+    return { state, caps, result };
   }
 
   async start(p: UserPrincipal, id: string, dto: StartDto) {
     const s = await this.access.assertSession(p, id);
+    if (s.status === 'STOPPED' || s.status === 'FAILED') throw new ApiError('PRECONDITION_FAILED', `session is ${s.status}`);
     if (!dto.userConfirmed) throw new ApiError('PRECONDITION_FAILED', 'userConfirmed must be true');
     if (dto.planVersion !== s.planVersion) throw new ApiError('VERSION_CONFLICT', `planVersion ${dto.planVersion} != ${s.planVersion}`);
     const pf = await this.prisma.preflight.findFirst({ where: { id: dto.preflightId, sessionId: id } });
     if (!pf) throw new ApiError('NOT_FOUND', 'preflight not found');
     if (pf.expiresAt < new Date()) throw new ApiError('PRECONDITION_FAILED', 'preflight expired; run preflight again');
     if (pf.readiness !== 'READY') throw new ApiError('PRECONDITION_FAILED', 'preflight BLOCKED', pf.blockers);
-    const state = await this.vehicles.getState(p, s.vehicleId);
-    if (state.revision !== pf.stateRevision) throw new ApiError('PRECONDITION_FAILED', `state changed since preflight (rev ${pf.stateRevision} → ${state.revision}); run preflight again`);
+    // revision 비교 대신 최신 상태로 안전 규칙을 다시 평가 — 센서가 값을 계속 올려도 시작할 수 있다 (7.3-5)
+    const now = await this.evaluate(p, s);
+    if (now.result.readiness !== 'READY') throw new ApiError('PRECONDITION_FAILED', 'state changed since preflight; now BLOCKED', now.result.blockers);
 
-    await this.prisma.sleepSession.update({ where: { id }, data: { status: 'ACTIVE', startedAt: new Date() } });
+    await this.prisma.$transaction(async (tx) => {
+      await this.prisma.lockVehicle(tx, s.vehicleId);
+      const active = await tx.sleepSession.findFirst({ where: { vehicleId: s.vehicleId, status: 'ACTIVE' }, select: { id: true } });
+      if (active) throw new ApiError('PRECONDITION_FAILED', active.id === id ? 'session already ACTIVE' : `vehicle already has ACTIVE session ${active.id}`);
+      const r = await tx.sleepSession.updateMany({ where: { id, status: { in: ['PLANNED', 'PREFLIGHT'] } }, data: { status: 'ACTIVE', startedAt: new Date() } });
+      if (r.count !== 1) throw new ApiError('PRECONDITION_FAILED', 'session state changed; reload');
+    });
     // 차량은 이 이벤트를 받고 로컬 재검증 후에만 자동 관리를 시작한다
     this.events.publish({ type: 'PLAN_UPDATED', aggregateId: s.vehicleId, revision: s.planVersion, executionMode: s.executionMode, payload: { sessionId: id, status: 'ACTIVE', planVersion: s.planVersion, userActionId: dto.userActionId, note: 'vehicle must re-validate locally before acting' } });
     return this.view(id);
@@ -99,11 +112,13 @@ export class SessionsService {
   async stop(p: Principal, id: string, dto: StopDto) {
     const s = await this.access.assertSession(p, id);
     if (s.status === 'STOPPED') return this.view(id);
+    const pending = await this.prisma.command.findMany({ where: { sessionId: id, status: { in: ['REQUESTED', 'QUEUED', 'DISPATCHED'] } }, select: { id: true } });
     await this.prisma.$transaction([
       this.prisma.sleepSession.update({ where: { id }, data: { status: 'STOPPED', endedAt: new Date(), endReason: dto.reason } }),
       // 미완료 명령은 전부 취소 — 재연결 시 재생 금지
-      this.prisma.command.updateMany({ where: { sessionId: id, status: { in: ['REQUESTED', 'QUEUED', 'DISPATCHED'] } }, data: { status: 'CANCELLED', reason: `session stopped: ${dto.reason}` } }),
+      this.prisma.command.updateMany({ where: { id: { in: pending.map((c) => c.id) } }, data: { status: 'CANCELLED', reason: `session stopped: ${dto.reason}` } }),
     ]);
+    for (const c of pending) this.events.publish({ type: 'COMMAND_STATUS_CHANGED', aggregateId: s.vehicleId, executionMode: s.executionMode, payload: { commandId: c.id, status: 'CANCELLED', observed: null, reason: `session stopped: ${dto.reason}` } });
     this.events.publish({ type: 'PLAN_UPDATED', aggregateId: s.vehicleId, revision: s.planVersion, executionMode: s.executionMode, payload: { sessionId: id, status: 'STOPPED', reason: dto.reason, by: p.kind } });
     return this.view(id);
   }
