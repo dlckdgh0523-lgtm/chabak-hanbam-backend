@@ -47,7 +47,8 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
   constructor(private readonly prisma: PrismaService) {}
 
   onModuleInit() {
-    this.timer = setInterval(() => void this.drain(), 250);
+    // 여러 대여도 한 곳만 전파 (같은 행을 두 번 내보내지 않게)
+    this.timer = setInterval(() => void this.prisma.runExclusive('worker:outbox', () => this.drain()).catch((err: Error) => this.log.error(`drain failed: ${err.message}`)), 250);
   }
   onModuleDestroy() {
     if (this.timer) clearInterval(this.timer);

@@ -23,6 +23,7 @@ export function createPrismaMock(): PrismaMock {
       if (typeof key === 'symbol' || key === 'then') return undefined;
       if (key === '$transaction') return transaction;
       if (key === 'lock') return lock;
+      if (key === 'runExclusive') return runExclusive;
       if (!models.has(key)) {
         models.set(
           key,
@@ -49,6 +50,7 @@ export function createPrismaMock(): PrismaMock {
     if (list) list.push(release); else release();
     await prev;
   });
+  const runExclusive = jest.fn(async (_key: string, fn: () => Promise<unknown>) => { await fn(); }); // 단일 인스턴스: 항상 잡힌다
   const transaction = jest.fn(async (arg: unknown) => {
     if (typeof arg !== 'function') return Promise.all(arg as unknown[]);
     const tx = new Proxy(prisma, {}); // 트랜잭션마다 다른 tx (같은 mock 을 가리킴)

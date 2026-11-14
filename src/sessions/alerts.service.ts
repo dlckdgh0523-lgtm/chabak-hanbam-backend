@@ -17,29 +17,21 @@ const IMMEDIATE_KINDS = new Set(['CO_DETECTED', 'CO2_CRITICAL']); // D9: 30초 �
 export class AlertsService implements OnModuleInit {
   private readonly log = new Logger(AlertsService.name);
   private readonly staleMs: number;
-  private lastSeen = new Map<string, { at: number; sessionId?: string }>(); // vehicleId:metric
   private coPeak = new Map<string, { minute: number; value: number }>(); // vehicleId → 이번 분의 최고 CO
 
   constructor(private readonly prisma: PrismaService, private readonly access: AccessService, private readonly events: EventsService, cfg: ConfigService) {
     this.staleMs = Number(cfg.get('SENSOR_STALE_AFTER_MS') ?? 15000);
   }
 
-  async onModuleInit() {
-    // 재시작하면 메모리 감시 목록이 비어, 자는 중 이미 죽은 센서는 영원히 단절 경보가 안 난다 → ACTIVE 세션의 CO/CO₂ 를 지금 기준으로 다시 감시
-    const active = await this.prisma.sleepSession.findMany({ where: { status: 'ACTIVE' }, select: { id: true, vehicleId: true } });
-    for (const s of active) {
-      const cache = await this.prisma.vehicleStateCache.findUnique({ where: { vehicleId: s.vehicleId }, select: { metrics: true } });
-      for (const m of ['co2Ppm', 'coPpm']) if ((cache?.metrics as Record<string, unknown> | undefined)?.[m]) this.lastSeen.set(`${s.vehicleId}:${m}`, { at: Date.now(), sessionId: s.id });
-    }
+  onModuleInit() {
     this.events.bus.on('telemetry', (e: { vehicleId: string; sessionId?: string; metrics: Record<string, Observation>; deviceId: string }) => void this.onTelemetry(e));
-    setInterval(() => void this.sweepDisconnected(), 5000);
+    setInterval(() => void this.prisma.runExclusive('worker:sensor-watch', () => this.sweepDisconnected()).catch((err: Error) => this.log.error(`sensor watch failed: ${err.message}`)), 5000).unref();
   }
 
   // ── 규칙 평가 (서버 보조; 차량 로컬 경보가 1차) ──────────────
   private async onTelemetry(e: { vehicleId: string; sessionId?: string; metrics: Record<string, Observation>; deviceId: string }) {
     const active = e.sessionId ? await this.prisma.sleepSession.findFirst({ where: { id: e.sessionId, status: 'ACTIVE' } }) : await this.prisma.sleepSession.findFirst({ where: { vehicleId: e.vehicleId, status: 'ACTIVE' } });
     for (const [m, o] of Object.entries(e.metrics)) {
-      if (['co2Ppm', 'coPpm'].includes(m)) this.lastSeen.set(`${e.vehicleId}:${m}`, { at: Date.now(), sessionId: active?.id });
       if (!active || o.quality !== 'VALID' || typeof o.value !== 'number') continue;
       const mode = o.source === 'MOCK' ? 'MOCK' : active.executionMode;
       if (m === 'coPpm') {
@@ -60,14 +52,21 @@ export class AlertsService implements OnModuleInit {
     }
   }
 
+  /** 상태 캐시(DB)의 마지막 관측 시각으로 판단 — 재시작·다중 인스턴스에도 같은 결과. 단절 1회 = (세션, metric, 마지막 관측 시각) 1건 */
   private async sweepDisconnected() {
     const now = Date.now();
-    for (const [key, v] of this.lastSeen) {
-      if (now - v.at > this.staleMs && v.sessionId) {
-        const [vehicleId, metric] = key.split(':');
-        const s = await this.prisma.sleepSession.findFirst({ where: { id: v.sessionId, status: 'ACTIVE' } });
-        if (s) await this.raise(s.id, 'SENSOR_DISCONNECTED', 'WARNING', { metric, lastSeenAt: new Date(v.at).toISOString(), staleAfterMs: this.staleMs, note: '센서 단절과 차 전원 OFF 는 구별 불가능할 수 있음' }, s.executionMode, `disc:${vehicleId}:${metric}:${v.at}`);
-        this.lastSeen.delete(key);
+    const sessions = await this.prisma.sleepSession.findMany({ where: { status: 'ACTIVE' }, select: { id: true, vehicleId: true, startedAt: true, executionMode: true } });
+    if (!sessions.length) return;
+    const caches = await this.prisma.vehicleStateCache.findMany({ where: { vehicleId: { in: sessions.map((s) => s.vehicleId) } }, select: { vehicleId: true, metrics: true } });
+    const byVehicle = new Map(caches.map((c) => [c.vehicleId, c.metrics as unknown as Record<string, Observation>]));
+    for (const s of sessions) {
+      for (const metric of ['co2Ppm', 'coPpm']) {
+        const o = byVehicle.get(s.vehicleId)?.[metric];
+        if (!o) continue; // 이 차량에 그 센서가 아직 없다
+        // 시작 전에 끊긴 센서도 시작 시각부터 센다
+        const last = Math.max(Date.parse(o.observedAt), s.startedAt?.getTime() ?? 0);
+        if (now - last <= this.staleMs) continue;
+        await this.raise(s.id, 'SENSOR_DISCONNECTED', 'WARNING', { metric, lastSeenAt: new Date(last).toISOString(), staleAfterMs: this.staleMs, note: '센서 단절과 차 전원 OFF 는 구별 불가능할 수 있음' }, s.executionMode, `disc:${metric}:${last}`);
       }
     }
   }
@@ -85,7 +84,15 @@ export class AlertsService implements OnModuleInit {
     const existing = await this.prisma.alert.findFirst({ where: { sessionId, sourceEventId } });
     if (existing) return { alertId: existing.id, duplicate: true, status: existing.status };
     const s = await this.prisma.sleepSession.findUniqueOrThrow({ where: { id: sessionId } });
-    const a = await this.prisma.alert.create({ data: { sessionId, kind, severity, sourceEventId, evidence: evidence as Prisma.InputJsonValue, executionMode } });
+    let a;
+    try {
+      a = await this.prisma.alert.create({ data: { sessionId, kind, severity, sourceEventId, evidence: evidence as Prisma.InputJsonValue, executionMode } });
+    } catch (e) {
+      // (sessionId, sourceEventId) 유니크: 동시에 같은 경보를 만들면 한 건만 남는다
+      if ((e as Prisma.PrismaClientKnownRequestError).code !== 'P2002') throw e;
+      const dup = await this.prisma.alert.findFirstOrThrow({ where: { sessionId, sourceEventId } });
+      return { alertId: dup.id, duplicate: true, status: dup.status };
+    }
     // 전달 레코드: WSS(차량·폰) + PUSH(폰) 각각 추적. 기술 ACK ≠ 사용자 확인.
     await this.prisma.delivery.createMany({ data: [{ alertId: a.id, channel: 'WSS', recipientRef: `vehicle:${s.vehicleId}`, status: 'SENT' }, { alertId: a.id, channel: 'PUSH', recipientRef: `vehicle-users:${s.vehicleId}`, status: 'QUEUED' }] });
     this.events.publish({

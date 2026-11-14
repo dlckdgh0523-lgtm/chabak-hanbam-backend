@@ -129,9 +129,17 @@ describe('AlertsService', () => {
       expect(prisma.alert.create.mock.calls[1][0].data.executionMode).toBe('PLEOS_EMULATOR');
     });
 
+    // [백엔드 수정] 단절 감시는 메모리가 아니라 DB 상태 캐시의 observedAt 으로 본다(재시작·다중 인스턴스에도 같은 결과).
+    //   그래서 "텔레메트리 호출" 대신 상태 캐시와 ACTIVE 세션 조회를 mock 한다.
+    const watch = (metrics: Record<string, Observation>, sessions: unknown[] = [{ ...activeSession, startedAt: new Date(T0) }]) => {
+      prisma.sleepSession.findMany.mockResolvedValue(sessions);
+      prisma.vehicleStateCache.findMany.mockResolvedValue([{ vehicleId: 'vehicle-1', metrics }]);
+    };
+    const at = (ms: number) => new Date(T0 + ms).toISOString();
+
     // 의도: 센서가 꺼지면 감시가 비어 있는 상태다. 그걸 알려야 한다. 한 번 끊긴 동안 경보는 한 번만.
     it('2. CO₂ 값이 15초 동안 안 들어오면 SENSOR_DISCONNECTED(WARNING) 를 단절 1회당 하나 만든다', async () => {
-      await telemetry({ co2Ppm: reading(800) });
+      watch({ co2Ppm: reading(800) });
 
       jest.setSystemTime(T0 + 15_000);
       await sweep();
@@ -146,10 +154,10 @@ describe('AlertsService', () => {
 
     // 의도: 두 번째 끊김도 놓치지 않는다.
     it('2. 값이 다시 들어왔다가 또 끊기면 새 단절 경보를 만든다', async () => {
-      await telemetry({ coPpm: reading(0) });
+      watch({ coPpm: reading(0) });
       jest.setSystemTime(T0 + 16_000);
       await sweep();
-      await telemetry({ coPpm: reading(0) });
+      watch({ coPpm: reading(0, { observedAt: at(16_000) }) }); // 다시 들어옴
       jest.setSystemTime(T0 + 32_000);
       await sweep();
       expect(raised()).toEqual(['SENSOR_DISCONNECTED:WARNING', 'SENSOR_DISCONNECTED:WARNING']);
@@ -157,34 +165,44 @@ describe('AlertsService', () => {
 
     // [백엔드 결정 4.3.2-4-5] 센서 폰이 한 대뿐이라 꺼지면 감시가 빈다. 단절 경보는 차량 방(WSS)으로도 나가 차량 화면이 알 수 있다.
     it('4.3.2-4-5. 센서 단절 경보는 차량 방 이벤트(ALERT_RAISED)와 차량 WSS 전달 기록으로도 나간다', async () => {
-      await telemetry({ co2Ppm: reading(800) });
+      watch({ co2Ppm: reading(800) });
       jest.setSystemTime(T0 + 16_000);
       await sweep();
       expect(events.publish).toHaveBeenCalledWith(expect.objectContaining({ type: 'ALERT_RAISED', aggregateId: 'vehicle-1', payload: expect.objectContaining({ kind: 'SENSOR_DISCONNECTED' }) }));
       expect(prisma.delivery.createMany.mock.calls[0][0].data).toContainEqual(expect.objectContaining({ channel: 'WSS', recipientRef: 'vehicle:vehicle-1' }));
     });
 
-    // [백엔드 추가] 감시 목록은 메모리라 서버가 재시작하면 비어, 자는 중 이미 죽은 센서는 단절 경보가 영원히 안 난다.
-    it('2. 재시작 후에도 ACTIVE 세션의 CO/CO₂ 감시를 다시 걸어, 값이 안 오면 단절 경보를 만든다', async () => {
-      prisma.sleepSession.findMany.mockResolvedValue([{ id: 's-1', vehicleId: 'vehicle-1' }]);
-      prisma.vehicleStateCache.findUnique.mockResolvedValue({ metrics: { co2Ppm: reading(800) } });
-      await service.onModuleInit();
+    // [백엔드 추가] 재시작해도 DB 기준이라 감시가 비지 않는다. 시작 전에 이미 끊긴 센서는 시작 시각부터 센다.
+    it('2. 세션 시작 전에 끊긴 센서는 시작 시각부터 15초 뒤 경보한다 (재시작 후에도 같음)', async () => {
+      watch({ co2Ppm: reading(800, { observedAt: at(-3600_000) }) }, [{ ...activeSession, startedAt: new Date(T0) }]);
+      jest.setSystemTime(T0 + 10_000);
+      await sweep();
+      expect(alerts).toHaveLength(0);
       jest.setSystemTime(T0 + 16_000);
       await sweep();
       expect(raised()).toEqual(['SENSOR_DISCONNECTED:WARNING']);
+      expect(alerts[0].sourceEventId).toBe(`disc:co2Ppm:${T0}`); // (세션, metric, 단절 시작 시각) 유니크
+    });
+
+    // [백엔드 추가] 같은 단절을 두 곳(인스턴스)이 동시에 만들어도 유니크 충돌은 중복으로 처리하고 한 건만 남긴다.
+    it('2. 같은 단절 경보 생성이 유니크 충돌(P2002)이면 중복으로 보고 에러를 내지 않는다', async () => {
+      watch({ co2Ppm: reading(800) });
+      prisma.alert.findFirst.mockResolvedValueOnce(null);
+      prisma.alert.create.mockRejectedValueOnce(Object.assign(new Error('unique'), { code: 'P2002' }));
+      prisma.alert.findFirstOrThrow.mockResolvedValue({ id: 'alert-x', status: 'RAISED' });
+      jest.setSystemTime(T0 + 16_000);
+      await expect(sweep()).resolves.toBeUndefined();
+      expect(events.publish).not.toHaveBeenCalled();
     });
 
     // 의도: 일어나서 센서를 끈 걸 단절 경보로 울리면 안 된다.
     it('2. 세션이 끝났으면 단절 경보를 만들지 않는다', async () => {
-      await telemetry({ co2Ppm: reading(800) });
-      prisma.sleepSession.findFirst.mockResolvedValue(null);
+      watch({ co2Ppm: reading(800) }, []); // ACTIVE 세션 없음
       jest.setSystemTime(T0 + 16_000);
       await sweep();
       expect(alerts).toHaveLength(0);
     });
 
-    // 의도: 지금은 샘플(seq)마다 새 CO_DETECTED 를 만들어, CO 가 계속 높으면 센서 주기(5초)마다 경보가 쌓인다.
-    //       위험을 놓치지 않는 것과 경보 폭주 사이의 기준(1분? 값이 더 오를 때만?)이 정해지지 않아 todo 로 둔다.
     // [백엔드 결정] 1분 단위로 묶고, 그 분 안에서 값이 더 오르면 바로 새 경보. 다음 분에는 같은 값이어도 다시 알린다.
     it('3. CO_DETECTED 는 1분 단위로 묶되, 값이 더 오르면 바로 새 경보를 만든다', async () => {
       await telemetry({ coPpm: reading(80, { seq: 1 }) });

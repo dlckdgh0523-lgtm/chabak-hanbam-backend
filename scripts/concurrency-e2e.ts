@@ -1,5 +1,6 @@
 /** 동시성 검증: 서버가 :3000 에 떠 있어야 한다. 빈 DB 기준. */
 import { randomUUID } from 'crypto';
+import { execSync } from 'child_process';
 
 const BASE = 'http://localhost:3000/v1';
 let pass = 0, fail = 0;
@@ -133,6 +134,13 @@ const idem = () => ({ 'idempotency-key': randomUUID() });
   ok('second owner unlink 204', (await call('DELETE', `/vehicle-links/${link2}`, USER2)).status === 204);
   ok('car token still works for remaining owner', (await call('POST', `/vehicles/${vehicleId}/heartbeats`, CAR, { executionMode: 'PLEOS_EMULATOR', powerState: 'PARKED' })).status === 200);
   ok('unlinked user lost access → 404', (await call('GET', `/vehicles/${vehicleId}/state`, USER2)).status === 404);
+
+  console.log('\n[L] 1회용 등록 코드: 같은 코드로 5대 동시 등록 → 1대만, 재사용 403');
+  // 발급 스크립트를 그대로 쓴다 (서버와 같은 DATABASE_URL·DEVICE_TOKEN_PEPPER 환경에서 실행)
+  const code = execSync('npx tsx scripts/provision.ts --count 1 --ttl-days 1 --label conc', { encoding: 'utf8' }).trim().split('\n').at(-1)!;
+  const enrolls = await Promise.all(Array.from({ length: 5 }, () => call('POST', '/devices/vehicle/enroll', undefined, { enrollSecret: code, displayName: 'PRV', powertrain: 'EV' })));
+  ok(`one 201, rest 403 (${enrolls.map((r) => r.status).join(',')})`, enrolls.filter((r) => r.status === 201).length === 1 && enrolls.filter((r) => r.status === 403).length === 4);
+  ok('reused code → 403', (await call('POST', '/devices/vehicle/enroll', undefined, { enrollSecret: code, displayName: 'PRV' })).status === 403);
 
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);
   process.exit(fail ? 1 : 0);

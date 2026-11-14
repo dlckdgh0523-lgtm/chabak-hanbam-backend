@@ -152,5 +152,59 @@ describe('AuthService', () => {
       await service.enrollVehicleDevice({ enrollSecret: 'enroll-secret', displayName: 'x' } as never);
       expect(prisma.vehicle.create.mock.calls[0][0].data.powertrain).toBe('UNKNOWN');
     });
+
+    // [백엔드 추가] 차량별 1회용 등록 코드. 공용 설치 비밀은 유출되면 차량을 무제한 등록할 수 있다.
+    describe('1회용 등록 코드 (ProvisioningCode)', () => {
+      type Code = { codeHash: string; usedAt: Date | null; expiresAt: Date; usedByVehicleId?: string };
+      let codes: Code[];
+      const ok = (c: Code, where: { codeHash: string; expiresAt: { gt: Date } }) => c.codeHash === where.codeHash && c.usedAt === null && c.expiresAt > where.expiresAt.gt;
+      const tick = () => new Promise((r) => setImmediate(r));
+      const issue = (raw: string, expiresAt = new Date(Date.now() + 86400_000)) => codes.push({ codeHash: tokens.hash(raw), usedAt: null, expiresAt });
+
+      beforeEach(() => {
+        codes = [];
+        prisma.provisioningCode.findFirst.mockImplementation(async ({ where }) => { await tick(); return codes.find((c) => ok(c, where)) ?? null; });
+        // DB 의 조건부 UPDATE 처럼 확인과 변경이 한 번에 일어난다
+        prisma.provisioningCode.updateMany.mockImplementation(async ({ where, data }) => { await tick(); const rows = codes.filter((c) => ok(c, where)); rows.forEach((c) => Object.assign(c, data)); return { count: rows.length }; });
+      });
+
+      it('맞는 코드면 등록하고 코드를 사용 처리(usedAt, usedByVehicleId)한다. 원문은 저장하지 않는다', async () => {
+        const service = build();
+        issue('prv_good');
+        await expect(service.enrollVehicleDevice({ enrollSecret: 'prv_good', displayName: 'x' } as never)).resolves.toMatchObject({ vehicleId: 'vehicle-1' });
+        expect(codes[0]).toMatchObject({ usedAt: expect.any(Date), usedByVehicleId: 'vehicle-1' });
+        expect(JSON.stringify(codes)).not.toContain('prv_good');
+      });
+
+      it('이미 쓴 코드, 만료된 코드는 403', async () => {
+        const service = build();
+        issue('prv_once');
+        issue('prv_old', new Date(Date.now() - 1));
+        await service.enrollVehicleDevice({ enrollSecret: 'prv_once', displayName: 'x' } as never);
+        await expectApiError(service.enrollVehicleDevice({ enrollSecret: 'prv_once', displayName: 'x' } as never), 'FORBIDDEN', 403);
+        await expectApiError(service.enrollVehicleDevice({ enrollSecret: 'prv_old', displayName: 'x' } as never), 'FORBIDDEN', 403);
+      });
+
+      it('같은 코드로 동시에 두 대가 등록하면 한 대만 성공한다', async () => {
+        const service = build();
+        issue('prv_race');
+        const r = await Promise.allSettled([1, 2].map(() => service.enrollVehicleDevice({ enrollSecret: 'prv_race', displayName: 'x' } as never)));
+        expect(r.map((x) => x.status).sort()).toEqual(['fulfilled', 'rejected']);
+        expect((r.find((x) => x.status === 'rejected') as PromiseRejectedResult).reason).toMatchObject({ code: 'FORBIDDEN' });
+      });
+
+      it('production 에서는 공용 설치 비밀을 거부한다 (dev 에서만 데모 리허설용으로 허용)', async () => {
+        const service = build({ NODE_ENV: 'production' });
+        await expectApiError(service.enrollVehicleDevice({ enrollSecret: 'enroll-secret', displayName: 'x' } as never), 'FORBIDDEN', 403);
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+      });
+
+      it('같은 IP 에서 10번 실패하면 그 뒤로는 맞는 값이어도 429', async () => {
+        const service = build();
+        for (let i = 0; i < 10; i++) await expectApiError(service.enrollVehicleDevice({ enrollSecret: `bad-${i}`, displayName: 'x' } as never, '1.2.3.4'), 'FORBIDDEN', 403);
+        await expectApiError(service.enrollVehicleDevice({ enrollSecret: 'enroll-secret', displayName: 'x' } as never, '1.2.3.4'), 'RATE_LIMITED', 429);
+        await expect(service.enrollVehicleDevice({ enrollSecret: 'enroll-secret', displayName: 'x' } as never, '5.6.7.8')).resolves.toBeDefined();
+      });
+    });
   });
 });
