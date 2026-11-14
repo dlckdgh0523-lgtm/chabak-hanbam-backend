@@ -101,6 +101,39 @@ const idem = () => ({ 'idempotency-key': randomUUID() });
   const puts = await Promise.all(Array.from({ length: 5 }, (_, i) => call('PUT', '/emergency-contacts', USER, { expectedVersion: v, contacts: [{ name: `n${i}`, phone: '010-1111-1111' }] })));
   ok(`exactly one 200 (got ${puts.map((r) => r.status).join(',')})`, puts.filter((r) => r.status === 200).length === 1);
 
+  console.log('\n[H] 연락처: 이름만 바꿔도 id 유지, 빈 목록 저장 뒤 옛 버전은 409 (ABA)');
+  const cur = (await call('GET', '/emergency-contacts', USER)).body;
+  const renamed = (await call('PUT', '/emergency-contacts', USER, { expectedVersion: cur.version, contacts: [{ id: cur.contacts[0].id, name: 'renamed' }] })).body;
+  ok('id kept on rename', renamed.contacts[0].id === cur.contacts[0].id && renamed.contacts[0].maskedPhone === cur.contacts[0].maskedPhone);
+  const emptied = (await call('PUT', '/emergency-contacts', USER, { expectedVersion: renamed.version, contacts: [] })).body;
+  ok(`version keeps rising on empty list (${emptied.version})`, emptied.version === renamed.version + 1);
+  ok('stale version 0 after empty → 409', (await call('PUT', '/emergency-contacts', USER, { expectedVersion: 0, contacts: [{ name: 'x', phone: '010-2222-2222' }] })).status === 409);
+
+  console.log('\n[I] CO 85ppm 3번 → CO_DETECTED 1건, 95ppm → 1건 더');
+  const coAlerts = async () => (await call('GET', `/sleep-sessions/${sessions[2]}/alerts`, USER)).body.filter((a: any) => a.kind === 'CO_DETECTED').length;
+  for (const [i, v] of [85, 85, 85].entries()) await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, SENSOR, { samples: [{ metric: 'coPpm', value: v, unit: 'ppm', source: 'BLE_SENSOR', observedAt: new Date().toISOString(), seq: 5000 + i, bootId: 'b-co' }] });
+  await new Promise((r) => setTimeout(r, 300));
+  const co1 = await coAlerts();
+  await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, SENSOR, { samples: [{ metric: 'coPpm', value: 95, unit: 'ppm', source: 'BLE_SENSOR', observedAt: new Date().toISOString(), seq: 5010, bootId: 'b-co' }] });
+  await new Promise((r) => setTimeout(r, 300));
+  const co2 = await coAlerts();
+  ok(`deduped within minute (${co1}), rising value re-alerts (${co2})`, co1 === 1 && co2 === 2);
+
+  console.log('\n[J] SMS 사용자 하루 20건 상한');
+  const cid2 = (await call('PUT', '/emergency-contacts', USER, { expectedVersion: emptied.version, contacts: [{ name: 'q', phone: '010-3333-3333' }] })).body.contacts[0].id;
+  const tests = [];
+  for (let i = 0; i < 22; i++) tests.push((await call('POST', '/emergency-contacts/test-sms', USER, { contactId: cid2, userActionId: `j${i}` }, idem())).status);
+  ok(`accepted ≤ 20 then 429 (202×${tests.filter((s) => s === 202).length}, 429×${tests.filter((s) => s === 429).length})`, tests.filter((s) => s === 202).length <= 20 && tests.at(-1) === 429);
+
+  console.log('\n[K] 공동 사용자: 한 명이 연결 해제해도 차량 장치는 살아있음');
+  const USER2 = (await call('POST', '/auth/sessions', undefined, { provider: 'DEV', credential: 'conc-2' })).body.accessToken;
+  const qr2 = JSON.parse((await call('POST', '/pairings', CAR)).body.qrPayload);
+  await call('POST', `/pairings/${qr2.pairingId}/claim`, USER2, { secret: qr2.secret });
+  const link2 = (await call('POST', `/pairings/${qr2.pairingId}/confirm`, CAR)).body.linkId;
+  ok('second owner unlink 204', (await call('DELETE', `/vehicle-links/${link2}`, USER2)).status === 204);
+  ok('car token still works for remaining owner', (await call('POST', `/vehicles/${vehicleId}/heartbeats`, CAR, { executionMode: 'PLEOS_EMULATOR', powerState: 'PARKED' })).status === 200);
+  ok('unlinked user lost access → 404', (await call('GET', `/vehicles/${vehicleId}/state`, USER2)).status === 404);
+
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);
   process.exit(fail ? 1 : 0);
 })();

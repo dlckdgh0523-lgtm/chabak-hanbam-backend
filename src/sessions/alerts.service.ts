@@ -9,6 +9,7 @@ import { ApiError, notFound } from '../common/errors';
 import { Principal, UserPrincipal } from '../auth/principal';
 import { Observation } from '../common/freshness';
 import { ALERT_RULES } from './policy';
+import { consumeSmsQuota } from '../common/sms-quota';
 
 const IMMEDIATE_KINDS = new Set(['CO_DETECTED', 'CO2_CRITICAL']); // D9: 30초 지연 없음
 
@@ -17,6 +18,7 @@ export class AlertsService implements OnModuleInit {
   private readonly log = new Logger(AlertsService.name);
   private readonly staleMs: number;
   private lastSeen = new Map<string, { at: number; sessionId?: string }>(); // vehicleId:metric
+  private coPeak = new Map<string, { minute: number; value: number }>(); // vehicleId → 이번 분의 최고 CO
 
   constructor(private readonly prisma: PrismaService, private readonly access: AccessService, private readonly events: EventsService, cfg: ConfigService) {
     this.staleMs = Number(cfg.get('SENSOR_STALE_AFTER_MS') ?? 15000);
@@ -41,7 +43,14 @@ export class AlertsService implements OnModuleInit {
       if (!active || o.quality !== 'VALID' || typeof o.value !== 'number') continue;
       const mode = o.source === 'MOCK' ? 'MOCK' : active.executionMode;
       if (m === 'coPpm') {
-        if (o.value >= ALERT_RULES.coCriticalPpm) await this.raise(active.id, 'CO_DETECTED', 'CRITICAL', { metric: m, value: o.value, observedAt: o.observedAt, source: o.source }, mode, `co:${e.vehicleId}:${o.bootId}:${o.seq}`);
+        if (o.value >= ALERT_RULES.coCriticalPpm) {
+          // 5초 샘플마다 새 경보를 쌓으면 푸시가 폭주한다 → 1분 단위로 묶되, 값이 더 오르면 새로 경보
+          const minute = Math.floor(Date.now() / 60_000), peak = this.coPeak.get(e.vehicleId);
+          if (!peak || peak.minute !== minute || o.value > peak.value) {
+            this.coPeak.set(e.vehicleId, { minute, value: o.value });
+            await this.raise(active.id, 'CO_DETECTED', 'CRITICAL', { metric: m, value: o.value, observedAt: o.observedAt, source: o.source }, mode, `co:${e.vehicleId}:${minute}:${o.value}`);
+          }
+        }
         else if (o.value >= ALERT_RULES.coWarnPpm) await this.raise(active.id, 'CO_ELEVATED', 'WARNING', { metric: m, value: o.value, observedAt: o.observedAt, source: o.source }, mode, `co-warn:${e.vehicleId}:${Math.floor(Date.now() / 300_000)}`);
       }
       if (m === 'co2Ppm') {
@@ -125,6 +134,7 @@ export class AlertsService implements OnModuleInit {
       if (recent) throw new ApiError('RATE_LIMITED', 'SMS for this alert sent within 5 minutes');
       const contacts = await tx.emergencyContact.findMany({ where: { userId: p.userId, id: { in: dto.recipients } } });
       if (contacts.length !== dto.recipients.length) throw notFound('contact');
+      await consumeSmsQuota(this.prisma, tx, p.userId, contacts.length);
       for (const c of contacts) await tx.delivery.create({ data: { alertId, channel: 'SMS', recipientRef: `contact:${c.id}`, status: 'QUEUED', providerMessageId: `log-${jobId}` } });
       return contacts;
     });

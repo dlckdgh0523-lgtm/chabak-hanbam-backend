@@ -17,6 +17,9 @@ model User {
   timezone            String    @default("Asia/Seoul")
   deletionRequestedAt DateTime?
   createdAt           DateTime  @default(now())
+  contactsVersion     Int       @default(0) // 연락처 목록 버전. 행 최대값으로 계산하면 빈 목록 저장 시 0으로 되돌아간다
+  smsQuotaDay         String? // UTC YYYY-MM-DD
+  smsQuotaUsed        Int       @default(0)
 
   devices           Device[]
   vehicleLinks      VehicleLink[]
