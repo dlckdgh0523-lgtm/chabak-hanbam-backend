@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ApiError, notFound } from '../common/errors';
 import { DevicePrincipal, UserPrincipal } from '../auth/principal';
 import { TokenService } from '../auth/token.service';
+import { EventsService } from '../events/events.service';
 
 /** 연락처 at-rest 암호화. 키는 DEVICE_TOKEN_PEPPER 파생(시연용). 운영은 KMS 로 교체. */
 @Injectable()
@@ -12,7 +13,7 @@ export class AccountService {
   private readonly log = new Logger(AccountService.name);
   private readonly key: Buffer;
 
-  constructor(private readonly prisma: PrismaService, private readonly cfg: ConfigService, private readonly tokens: TokenService) {
+  constructor(private readonly prisma: PrismaService, private readonly cfg: ConfigService, private readonly tokens: TokenService, private readonly events: EventsService) {
     this.key = createHash('sha256').update('contacts:' + cfg.getOrThrow('DEVICE_TOKEN_PEPPER')).digest();
   }
 
@@ -49,13 +50,15 @@ export class AccountService {
   }
 
   async putContacts(userId: string, contacts: { id?: string; name: string; phone?: string }[], expectedVersion: number) {
-    const current = await this.getContacts(userId);
-    if (current.version !== expectedVersion) throw new ApiError('VERSION_CONFLICT', `expectedVersion ${expectedVersion} != ${current.version}`);
-    const old = new Map((await this.prisma.emergencyContact.findMany({ where: { userId } })).map((r) => [r.id, r.phoneEncrypted]));
-    const phones = contacts.map((c) => (c.phone !== undefined ? this.enc(c.phone) : old.get(c.id ?? '')));
-    if (phones.some((p) => p === undefined)) throw new ApiError('VALIDATION_FAILED', 'phone required for new contact');
     const version = expectedVersion + 1;
     await this.prisma.$transaction(async (tx) => {
+      await this.prisma.lock(tx, `contacts:${userId}`);
+      const rows = await tx.emergencyContact.findMany({ where: { userId } });
+      const current = rows.reduce((m, r) => Math.max(m, r.version), 0);
+      if (current !== expectedVersion) throw new ApiError('VERSION_CONFLICT', `expectedVersion ${expectedVersion} != ${current}`);
+      const old = new Map(rows.map((r) => [r.id, r.phoneEncrypted]));
+      const phones = contacts.map((c) => (c.phone !== undefined ? this.enc(c.phone) : old.get(c.id ?? '')));
+      if (phones.some((p) => p === undefined)) throw new ApiError('VALIDATION_FAILED', 'phone required for new contact');
       await tx.emergencyContact.deleteMany({ where: { userId } });
       for (let i = 0; i < contacts.length; i++) {
         await tx.emergencyContact.create({ data: { userId, priority: i + 1, nameEncrypted: this.enc(contacts[i].name), phoneEncrypted: phones[i]!, version } });
@@ -95,7 +98,8 @@ export class AccountService {
     if (!link) throw notFound('vehicle');
     const t = this.tokens.newDeviceToken();
     const d = await this.prisma.$transaction(async (tx) => {
-      await this.prisma.lockVehicle(tx, vehicleId);
+      await this.prisma.lock(tx, vehicleId);
+      if (await tx.sleepSession.findFirst({ where: { vehicleId, status: 'ACTIVE' }, select: { id: true } })) throw new ApiError('PRECONDITION_FAILED', 'sleep session ACTIVE; stop it before replacing the sensor');
       // 차량당 센서 1대: 다른 사용자가 발급한 센서도 폐기 (명세 4.3.2)
       const old = await tx.vehicleLink.findMany({ where: { vehicleId, status: 'ACTIVE', device: { type: 'SENSOR' } }, select: { id: true, deviceId: true } });
       if (old.length) {
@@ -104,14 +108,16 @@ export class AccountService {
       }
       const d = await tx.device.create({ data: { userId: p.userId, type: 'SENSOR', displayName: 'phone-sensor', tokenHash: t.hash } });
       await tx.vehicleLink.create({ data: { userId: p.userId, vehicleId, deviceId: d.id, role: 'PHONE_DEVICE', status: 'ACTIVE' } });
-      return d;
+      return { d, old };
     });
-    return { deviceId: d.id, deviceToken: t.raw, scope: 'sensor' as const };
+    if (d.old.length) this.events.bus.emit('revoked', { principals: d.old.map((l) => `DEVICE:${l.deviceId}`) });
+    return { deviceId: d.d.id, deviceToken: t.raw, scope: 'sensor' as const };
   }
 
   async requestDeletion(userId: string, reauth: string) {
     const u = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     if (u.authSubject !== `dev:${reauth}`) throw new ApiError('UNAUTHENTICATED', 'reauthentication failed');
+    const devices = await this.prisma.device.findMany({ where: { userId }, select: { id: true } });
     await this.prisma.$transaction([
       this.prisma.user.update({ where: { id: userId }, data: { deletionRequestedAt: new Date() } }),
       this.prisma.vehicleLink.updateMany({ where: { userId, status: 'ACTIVE' }, data: { status: 'REVOKED', revokedAt: new Date() } }),
@@ -119,6 +125,7 @@ export class AccountService {
       this.prisma.refreshToken.updateMany({ where: { userId }, data: { revokedAt: new Date() } }),
       this.prisma.emergencyContact.deleteMany({ where: { userId } }),
     ]);
+    this.events.bus.emit('revoked', { principals: [`USER:${userId}`, ...devices.map((d) => `DEVICE:${d.id}`)] });
     return { status: 'DELETION_SCHEDULED', retention: 'summaries purged after retention window (policy TBD)' };
   }
 }

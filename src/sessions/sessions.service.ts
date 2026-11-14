@@ -98,10 +98,10 @@ export class SessionsService {
     if (now.result.readiness !== 'READY') throw new ApiError('PRECONDITION_FAILED', 'state changed since preflight; now BLOCKED', now.result.blockers);
 
     await this.prisma.$transaction(async (tx) => {
-      await this.prisma.lockVehicle(tx, s.vehicleId);
+      await this.prisma.lock(tx, s.vehicleId);
       const active = await tx.sleepSession.findFirst({ where: { vehicleId: s.vehicleId, status: 'ACTIVE' }, select: { id: true } });
       if (active) throw new ApiError('PRECONDITION_FAILED', active.id === id ? 'session already ACTIVE' : `vehicle already has ACTIVE session ${active.id}`);
-      const r = await tx.sleepSession.updateMany({ where: { id, status: { in: ['PLANNED', 'PREFLIGHT'] } }, data: { status: 'ACTIVE', startedAt: new Date() } });
+      const r = await tx.sleepSession.updateMany({ where: { id, planVersion: dto.planVersion, status: { in: ['PLANNED', 'PREFLIGHT'] } }, data: { status: 'ACTIVE', startedAt: new Date() } });
       if (r.count !== 1) throw new ApiError('PRECONDITION_FAILED', 'session state changed; reload');
     });
     // 차량은 이 이벤트를 받고 로컬 재검증 후에만 자동 관리를 시작한다

@@ -82,6 +82,25 @@ const idem = () => ({ 'idempotency-key': randomUUID() });
   const five = await Promise.all(Array.from({ length: 5 }, (_, i) => start(sessions[2], p2.preflightId, `d${i}`)));
   ok(`exactly one 200 (got ${five.map((r) => r.status).join(',')})`, five.filter((r) => r.status === 200).length === 1);
 
+  console.log('\n[E] 같은 Idempotency-Key 동시 5번 → 예약 1건만 생성');
+  const key = randomUUID();
+  const tripBody = { placeId: place.id, vehicleId, startAt: `${tomorrow}T12:00:00Z`, endAt: `${tomorrow}T23:00:00Z`, timezone: 'Asia/Seoul', people: 1 };
+  const same = await Promise.all(Array.from({ length: 5 }, () => call('POST', '/trips', USER, tripBody, { 'idempotency-key': key })));
+  const ids = new Set(same.filter((r) => r.status === 201).map((r) => r.body.id));
+  ok(`one trip created (ids ${ids.size}, statuses ${same.map((r) => r.status).join(',')})`, ids.size === 1 && same.every((r) => r.status === 201 || r.status === 409));
+
+  console.log('\n[F] 같은 경보 SMS 동시 5번(키 다름) → 202 1개');
+  const cv = (await call('GET', '/emergency-contacts', USER)).body.version;
+  const contactId = (await call('PUT', '/emergency-contacts', USER, { expectedVersion: cv, contacts: [{ name: 'a', phone: '010-0000-0000' }] })).body.contacts[0].id;
+  const alertId = (await call('POST', '/alerts/test', USER, { vehicleId, kind: 'PUSH' })).body.alertId;
+  const sms = await Promise.all(Array.from({ length: 5 }, (_, i) => call('POST', `/alerts/${alertId}/contact-notifications`, USER, { recipients: [contactId], template: 'ACCESS_HELP', userActionId: `f${i}` }, idem())));
+  ok(`exactly one 202 (got ${sms.map((r) => r.status).join(',')})`, sms.filter((r) => r.status === 202).length === 1);
+
+  console.log('\n[G] 연락처 같은 버전 동시 PUT 5번 → 200 1개');
+  const v = (await call('GET', '/emergency-contacts', USER)).body.version;
+  const puts = await Promise.all(Array.from({ length: 5 }, (_, i) => call('PUT', '/emergency-contacts', USER, { expectedVersion: v, contacts: [{ name: `n${i}`, phone: '010-1111-1111' }] })));
+  ok(`exactly one 200 (got ${puts.map((r) => r.status).join(',')})`, puts.filter((r) => r.status === 200).length === 1);
+
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);
   process.exit(fail ? 1 : 0);
 })();

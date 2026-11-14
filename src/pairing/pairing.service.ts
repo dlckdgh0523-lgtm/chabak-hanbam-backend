@@ -73,5 +73,7 @@ export class PairingService {
       this.prisma.device.update({ where: { id: link.deviceId }, data: { revokedAt: new Date(), tokenHash: null } }),
     ]);
     this.events.publish({ type: 'LINK_HEALTH_CHANGED', aggregateId: link.vehicleId, payload: { linkId, status: 'REVOKED' } });
+    this.events.bus.emit('revoked', { principals: [`USER:${link.userId}`], vehicleId: link.vehicleId });
+    this.events.bus.emit('revoked', { principals: [`DEVICE:${link.deviceId}`] });
   }
 }

@@ -44,7 +44,7 @@ export class CommandsService {
     if (process.env.NODE_ENV === 'production' && dto.executionMode === 'MOCK') throw new ApiError('FORBIDDEN', 'MOCK commands rejected in production');
     const type = dto.action?.type;
     if (!ALLOWLIST[dto.executionMode].includes(type)) throw new ApiError('UNSUPPORTED_CAPABILITY', `action ${type} not in ${dto.executionMode} allowlist`, { allowlist: ALLOWLIST[dto.executionMode] });
-    const bad = validateSync(plainToInstance(ACTION_DTO[type], dto.action));
+    const bad = validateSync(plainToInstance(ACTION_DTO[type], dto.action), { whitelist: true, forbidNonWhitelisted: true });
     if (bad.length) throw new ApiError('VALIDATION_FAILED', `invalid ${type} fields`, bad.map((e) => e.property));
     if (Date.parse(dto.expiresAt) <= Date.now()) throw new ApiError('VALIDATION_FAILED', 'expiresAt already passed');
 

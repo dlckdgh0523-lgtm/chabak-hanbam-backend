@@ -112,12 +112,16 @@ export class AlertsService implements OnModuleInit {
     const a = await this.prisma.alert.findUnique({ where: { id: alertId } });
     if (!a || !a.sessionId) throw notFound('alert');
     await this.access.assertSession(p, a.sessionId);
-    const recent = await this.prisma.delivery.findFirst({ where: { alertId, channel: 'SMS', createdAt: { gt: new Date(Date.now() - 300_000) } } });
-    if (recent) throw new ApiError('RATE_LIMITED', 'SMS for this alert sent within 5 minutes');
-    const contacts = await this.prisma.emergencyContact.findMany({ where: { userId: p.userId, id: { in: dto.recipients } } });
-    if (contacts.length !== dto.recipients.length) throw notFound('contact');
     const jobId = randomUUID();
-    for (const c of contacts) await this.prisma.delivery.create({ data: { alertId, channel: 'SMS', recipientRef: `contact:${c.id}`, status: 'QUEUED', providerMessageId: `log-${jobId}` } });
+    const contacts = await this.prisma.$transaction(async (tx) => {
+      await this.prisma.lock(tx, `sms:${alertId}`);
+      const recent = await tx.delivery.findFirst({ where: { alertId, channel: 'SMS', createdAt: { gt: new Date(Date.now() - 300_000) } } });
+      if (recent) throw new ApiError('RATE_LIMITED', 'SMS for this alert sent within 5 minutes');
+      const contacts = await tx.emergencyContact.findMany({ where: { userId: p.userId, id: { in: dto.recipients } } });
+      if (contacts.length !== dto.recipients.length) throw notFound('contact');
+      for (const c of contacts) await tx.delivery.create({ data: { alertId, channel: 'SMS', recipientRef: `contact:${c.id}`, status: 'QUEUED', providerMessageId: `log-${jobId}` } });
+      return contacts;
+    });
     this.log.log(`[SMS:log] job=${jobId} alert=${alertId} template=${dto.template} to=${contacts.length} userActionId=${dto.userActionId}`);
     return { jobId, recipients: contacts.length, note: 'provider acceptance ≠ read receipt; no exactly-once guarantee' };
   }

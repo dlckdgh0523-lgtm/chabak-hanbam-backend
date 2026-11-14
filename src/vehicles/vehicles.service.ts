@@ -74,11 +74,13 @@ export class VehiclesService {
       if (s.source === 'PLEOS' && p.deviceType !== 'CAR') throw new ApiError('FORBIDDEN', 'PLEOS source only from CAR device');
       if (s.source === 'BLE_SENSOR' && p.deviceType === 'CAR') { /* 실차 BLE 는 별도 검증 — 허용하되 출처 그대로 */ }
       const quality = s.quality ?? (s.value === null || s.value === undefined ? 'UNKNOWN' : 'VALID');
+      // 시계가 앞선 장치의 미래 값은 캐시를 영구 점유하고 STALE 도 안 된다 → 수신 시각으로 고정
+      const observedAt = new Date(Math.min(Date.parse(s.observedAt), receivedAt.getTime()));
       try {
         await this.prisma.telemetrySample.create({
           data: {
             vehicleId, sessionId: dto.sessionId, metric: s.metric, value: s.value === undefined ? Prisma.JsonNull : (s.value as Prisma.InputJsonValue),
-            unit: s.unit, source: s.source, sourceDeviceId: p.deviceId, observedAt: new Date(s.observedAt), receivedAt, seq: s.seq, bootId: s.bootId, quality,
+            unit: s.unit, source: s.source, sourceDeviceId: p.deviceId, observedAt, receivedAt, seq: s.seq, bootId: s.bootId, quality,
           },
         });
         accepted++;
@@ -87,17 +89,17 @@ export class VehiclesService {
         throw e;
       }
       const obs: Observation = {
-        value: s.value ?? null, unit: s.unit, source: s.source, sourceDeviceId: p.deviceId, observedAt: s.observedAt,
+        value: s.value ?? null, unit: s.unit, source: s.source, sourceDeviceId: p.deviceId, observedAt: observedAt.toISOString(),
         receivedAt: receivedAt.toISOString(), quality, seq: s.seq, bootId: s.bootId,
       };
       const prev = latest.get(s.metric);
-      if (!prev || Date.parse(prev.observedAt) <= Date.parse(s.observedAt)) latest.set(s.metric, obs);
+      if (!prev || Date.parse(prev.observedAt) <= observedAt.getTime()) latest.set(s.metric, obs);
     }
 
     if (latest.size) {
       // 늦게 온 과거 값이 최신 상태를 덮어쓰지 않게 metric 별 observedAt 비교. 락으로 동시 업로드끼리 서로의 metric 을 지우지 않는다.
       const revision = await this.prisma.$transaction(async (tx) => {
-        await this.prisma.lockVehicle(tx, vehicleId);
+        await this.prisma.lock(tx, vehicleId);
         const cache = await tx.vehicleStateCache.upsert({ where: { vehicleId }, create: { vehicleId, metrics: {} }, update: {} });
         const metrics = { ...(cache.metrics as unknown as Record<string, Observation>) };
         for (const [m, o] of latest) {

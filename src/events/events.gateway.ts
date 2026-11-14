@@ -28,6 +28,10 @@ export class EventsGateway implements OnGatewayInit, OnGatewayConnection, OnGate
 
   afterInit() {
     this.events.bus.on('event', (env: Envelope) => this.broadcast(env));
+    // 토큰·연결이 폐기되면 이미 열린 소켓도 닫는다. vehicleId 가 있으면 그 차량 방만.
+    this.events.bus.on('revoked', (r: { principals: string[]; vehicleId?: string }) => {
+      for (const c of this.clients.values()) if (r.principals.includes(c.principal) && (!r.vehicleId || c.rooms.has(r.vehicleId))) this.reject(c.ws, 4401, 'revoked');
+    });
   }
 
   async handleConnection(ws: WebSocket, req: IncomingMessage) {

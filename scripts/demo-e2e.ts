@@ -164,6 +164,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   ok('EMULATOR with writeAllowed=false → 422', cmdEmu.status === 422, cmdEmu.body);
   const cmd = await call('POST', `/vehicles/${vehicleId}/commands`, USER, { sessionId: sid, action: { type: 'REQUEST_FRESH_AIR', fanLevel: 3 }, expectedStateRevision: st.body.revision, capabilityRevision: 1, expiresAt: expires, userActionId: 'ua4', executionMode: 'MOCK' }, idem());
   ok('MOCK command DISPATCHED', cmd.status === 202 && cmd.body.status === 'DISPATCHED', cmd.body);
+  ok('command extra field → 400', (await call('POST', `/vehicles/${vehicleId}/commands`, USER, { sessionId: sid, action: { type: 'REQUEST_FRESH_AIR', fanLevel: 2, evil: 1 }, expectedStateRevision: st.body.revision, capabilityRevision: 1, expiresAt: expires, userActionId: 'ua4x', executionMode: 'MOCK' }, idem())).status === 400);
   ok('command field type checked → 400', (await call('POST', `/vehicles/${vehicleId}/commands`, USER, { sessionId: sid, action: { type: 'SET_CLIMATE_TARGET', targetTempC: 'abc', areaId: 'ROW_1_LEFT' }, expectedStateRevision: st.body.revision, capabilityRevision: 1, expiresAt: expires, userActionId: 'ua4b', executionMode: 'MOCK' }, idem())).status === 400);
   ok('older expectedStateRevision still accepted', (await call('POST', `/vehicles/${vehicleId}/commands`, USER, { sessionId: sid, action: { type: 'REQUEST_FRESH_AIR', fanLevel: 2 }, expectedStateRevision: st.body.revision - 1, capabilityRevision: 1, expiresAt: expires, userActionId: 'ua4c', executionMode: 'MOCK' }, idem())).status === 202);
   const cid = cmd.body.commandId;
@@ -210,9 +211,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   ok('sms job 202', sms.status === 202, sms.body);
   ok('sms rate-limited within 5min → 429', (await call('POST', `/alerts/${acc.body.alertId}/contact-notifications`, USER, { recipients: [c1.body.contacts[0].id], template: 'ACCESS_HELP', userActionId: 'ua6' }, idem())).status === 429);
 
-  const s1 = await call('POST', `/vehicles/${vehicleId}/sensor-tokens`, USER);
-  const s2 = await call('POST', `/vehicles/${vehicleId}/sensor-tokens`, USER);
-  ok('sensor token reissue revokes previous → 401', (await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, s1.body.deviceToken, {})).status === 401 && (await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, s2.body.deviceToken, {})).status !== 401);
+  ok('sensor token during ACTIVE session → 422', (await call('POST', `/vehicles/${vehicleId}/sensor-tokens`, USER)).status === 422);
 
   console.log('\n[14] 센서 단절 (15초 대기)');
   ok('demo SENSOR_DROP', (await call('POST', '/demo/scenarios', CAR, { vehicleId, sessionId: sid, scenario: 'SENSOR_DROP' })).status === 201);
@@ -225,6 +224,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   console.log('\n[15] stop + summary');
   const stop = await call('POST', `/sleep-sessions/${sid}/stop`, USER, { reason: 'USER_STOP' });
   ok('STOPPED', stop.body.status === 'STOPPED');
+  const s1 = await call('POST', `/vehicles/${vehicleId}/sensor-tokens`, USER);
+  const s2 = await call('POST', `/vehicles/${vehicleId}/sensor-tokens`, USER);
+  ok('sensor token reissue revokes previous → 401', (await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, s1.body.deviceToken, {})).status === 401 && (await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, s2.body.deviceToken, {})).status !== 401);
+  const future = new Date(Date.now() + 86400_000).toISOString();
+  await call('POST', `/vehicles/${vehicleId}/telemetry-batches`, s2.body.deviceToken, { samples: [{ metric: 'co2Ppm', value: 400, unit: 'ppm', source: 'BLE_SENSOR', observedAt: future, seq: 9000, bootId: 'skew' }] });
+  const skew = (await call('GET', `/vehicles/${vehicleId}/state`, USER)).body.metrics.co2Ppm;
+  ok('future observedAt clamped to receive time', Date.parse(skew.observedAt) <= Date.now(), skew);
   const sum = await call('GET', `/sleep-sessions/${sid}/summary`, USER);
   ok('summary marks missing coverage, not normal', sum.status === 200 && sum.body.coverage.coPpm !== '연속 기록' && sum.body.disclaimer, sum.body.coverage);
   const review = await call('POST', '/reviews', USER, { tripId: trip.body.id, rating: 4, text: '조용했음' });
@@ -234,11 +240,12 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   console.log('\n[16] WSS 이벤트 수신 확인');
   const types = new Set(events.map((e) => e.type));
   ok('received STATE_SNAPSHOT/COMMAND_DISPATCH/ALERT_RAISED/TRIP_SYNCED', ['STATE_SNAPSHOT', 'COMMAND_DISPATCH', 'ALERT_RAISED', 'TRIP_SYNCED'].every((t) => types.has(t)), [...types]);
-  ws.close();
 
   console.log('\n[17] 링크 해제 → 장치 토큰 폐기');
   const link = cf.body.linkId;
+  const wsClosed = new Promise<number>((res) => ws.on('close', (c) => res(c)));
   ok('unlink 204', (await call('DELETE', `/vehicle-links/${link}`, USER)).status === 204);
+  ok('open WS closed on unlink (4401)', (await Promise.race([wsClosed, sleep(2000).then(() => -1)])) === 4401);
   ok('car token now 401', (await call('GET', `/vehicles/${vehicleId}/state`, CAR)).status === 401);
 
   console.log(`\n==== ${pass} passed, ${fail} failed ====`);
