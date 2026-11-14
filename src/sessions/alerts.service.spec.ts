@@ -87,12 +87,13 @@ describe('AlertsService', () => {
       expect(timeouts).toEqual([0, 0]);
     });
 
-    // 의도: CO 위험은 값이 들어올 때마다 알린다. 같은 샘플이 재전송된 경우만 중복으로 본다.
-    it('1. CO_DETECTED 는 샘플마다 새 경보다 (seq 가 다르면 새로 만든다)', async () => {
+    // [백엔드 수정] 원래 "샘플(seq)마다 새 경보" 였다. 아래 todo 3 에서 정하기로 한 중복 단위를 1분 + 값 상승 시 재경보로 정해 바꿨다.
+    //   같은 샘플 재전송은 여전히 한 건이다.
+    it('1. CO_DETECTED 는 같은 분 안에서 값이 그대로면 다시 만들지 않는다 (재전송 포함)', async () => {
       await telemetry({ coPpm: reading(80, { seq: 1 }) });
-      await telemetry({ coPpm: reading(80, { seq: 1 }) }); // 같은 샘플 재전송 → 중복
-      await telemetry({ coPpm: reading(80, { seq: 2 }) });
-      expect(raised()).toEqual(['CO_DETECTED:CRITICAL', 'CO_DETECTED:CRITICAL']);
+      await telemetry({ coPpm: reading(80, { seq: 1 }) }); // 같은 샘플 재전송
+      await telemetry({ coPpm: reading(80, { seq: 2 }) }); // 5초 뒤 같은 값
+      expect(raised()).toEqual(['CO_DETECTED:CRITICAL']);
     });
 
     // 의도: 경고가 5초마다 울리면 사용자가 무시하게 된다. 5분 구간 경계에서 새 경보가 나는지도 본다.
@@ -123,6 +124,7 @@ describe('AlertsService', () => {
     it('1. MOCK 출처 값으로 만든 경보는 MOCK 모드다', async () => {
       await telemetry({ coPpm: reading(80, { source: 'MOCK' }) });
       expect(prisma.alert.create.mock.calls[0][0].data.executionMode).toBe('MOCK');
+      jest.setSystemTime(T0 + 60_000); // [백엔드 수정] CO_DETECTED 1분 묶음 — 다음 분으로 넘겨 새 경보를 만든다
       await telemetry({ coPpm: reading(80, { seq: 9 }) });
       expect(prisma.alert.create.mock.calls[1][0].data.executionMode).toBe('PLEOS_EMULATOR');
     });
@@ -153,6 +155,25 @@ describe('AlertsService', () => {
       expect(raised()).toEqual(['SENSOR_DISCONNECTED:WARNING', 'SENSOR_DISCONNECTED:WARNING']);
     });
 
+    // [백엔드 결정 4.3.2-4-5] 센서 폰이 한 대뿐이라 꺼지면 감시가 빈다. 단절 경보는 차량 방(WSS)으로도 나가 차량 화면이 알 수 있다.
+    it('4.3.2-4-5. 센서 단절 경보는 차량 방 이벤트(ALERT_RAISED)와 차량 WSS 전달 기록으로도 나간다', async () => {
+      await telemetry({ co2Ppm: reading(800) });
+      jest.setSystemTime(T0 + 16_000);
+      await sweep();
+      expect(events.publish).toHaveBeenCalledWith(expect.objectContaining({ type: 'ALERT_RAISED', aggregateId: 'vehicle-1', payload: expect.objectContaining({ kind: 'SENSOR_DISCONNECTED' }) }));
+      expect(prisma.delivery.createMany.mock.calls[0][0].data).toContainEqual(expect.objectContaining({ channel: 'WSS', recipientRef: 'vehicle:vehicle-1' }));
+    });
+
+    // [백엔드 추가] 감시 목록은 메모리라 서버가 재시작하면 비어, 자는 중 이미 죽은 센서는 단절 경보가 영원히 안 난다.
+    it('2. 재시작 후에도 ACTIVE 세션의 CO/CO₂ 감시를 다시 걸어, 값이 안 오면 단절 경보를 만든다', async () => {
+      prisma.sleepSession.findMany.mockResolvedValue([{ id: 's-1', vehicleId: 'vehicle-1' }]);
+      prisma.vehicleStateCache.findUnique.mockResolvedValue({ metrics: { co2Ppm: reading(800) } });
+      await service.onModuleInit();
+      jest.setSystemTime(T0 + 16_000);
+      await sweep();
+      expect(raised()).toEqual(['SENSOR_DISCONNECTED:WARNING']);
+    });
+
     // 의도: 일어나서 센서를 끈 걸 단절 경보로 울리면 안 된다.
     it('2. 세션이 끝났으면 단절 경보를 만들지 않는다', async () => {
       await telemetry({ co2Ppm: reading(800) });
@@ -164,7 +185,16 @@ describe('AlertsService', () => {
 
     // 의도: 지금은 샘플(seq)마다 새 CO_DETECTED 를 만들어, CO 가 계속 높으면 센서 주기(5초)마다 경보가 쌓인다.
     //       위험을 놓치지 않는 것과 경보 폭주 사이의 기준(1분? 값이 더 오를 때만?)이 정해지지 않아 todo 로 둔다.
-    it.todo('3. (확인 필요) CO_DETECTED 가 5초마다 새로 쌓이지 않도록 중복을 어느 단위로 막을지');
+    // [백엔드 결정] 1분 단위로 묶고, 그 분 안에서 값이 더 오르면 바로 새 경보. 다음 분에는 같은 값이어도 다시 알린다.
+    it('3. CO_DETECTED 는 1분 단위로 묶되, 값이 더 오르면 바로 새 경보를 만든다', async () => {
+      await telemetry({ coPpm: reading(80, { seq: 1 }) });
+      await telemetry({ coPpm: reading(75, { seq: 2 }) }); // 내려감 → 없음
+      await telemetry({ coPpm: reading(120, { seq: 3 }) }); // 오름 → 새 경보
+      expect(alerts).toHaveLength(2);
+      jest.setSystemTime(T0 + 50_000); // 15:01:00 다음 분
+      await telemetry({ coPpm: reading(80, { seq: 4 }) });
+      expect(raised()).toEqual(['CO_DETECTED:CRITICAL', 'CO_DETECTED:CRITICAL', 'CO_DETECTED:CRITICAL']);
+    });
 
     // 의도: 경보가 어디까지 전달됐는지(차량 화면, 폰 푸시)를 채널별로 추적한다.
     it('4. 경보를 만들면 전달 기록 WSS(SENT)·PUSH(QUEUED) 를 만들고 ALERT_RAISED 이벤트를 보낸다', async () => {
@@ -300,6 +330,8 @@ describe('AlertsService', () => {
       prisma.alert.findUnique.mockResolvedValue({ id: 'alert-1', sessionId: 's-1' });
       access.assertSession.mockResolvedValue(activeSession);
       prisma.delivery.findFirst.mockResolvedValue(null);
+      // [백엔드 수정] 경보 SMS 도 사용자당 하루 20건 한도를 쓴다(테스트 SMS 와 합산)
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ smsQuotaDay: null, smsQuotaUsed: 0 });
     });
 
     // 의도: 남의 연락처로 문자를 보내는 통로가 되지 않게. 일부만 보내지도 않는다.
@@ -324,6 +356,14 @@ describe('AlertsService', () => {
       expect(res).toMatchObject({ jobId: expect.any(String), recipients: 2 });
       expect(prisma.delivery.create).toHaveBeenCalledTimes(2);
       expect(prisma.delivery.create.mock.calls[0][0].data).toMatchObject({ alertId: 'alert-1', channel: 'SMS', recipientRef: 'contact:c-1', status: 'QUEUED' });
+    });
+
+    // [백엔드 추가] 연락처에는 아무 번호나 넣을 수 있어 문자 폭탄·비용 악용 통로가 된다. 오늘 이미 19건이면 2명에게는 못 보낸다.
+    it('6. 사용자당 하루 SMS 한도(20건)를 넘으면 429 이고 보내지 않는다', async () => {
+      prisma.emergencyContact.findMany.mockResolvedValue([{ id: 'c-1' }, { id: 'c-2' }]);
+      prisma.user.findUniqueOrThrow.mockResolvedValue({ smsQuotaDay: new Date(T0).toISOString().slice(0, 10), smsQuotaUsed: 19 });
+      await expectApiError(service.contactNotification(userPrincipal(), 'alert-1', dto), 'RATE_LIMITED', 429);
+      expect(prisma.delivery.create).not.toHaveBeenCalled();
     });
   });
 

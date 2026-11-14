@@ -112,13 +112,14 @@ export class SessionsService {
   async stop(p: Principal, id: string, dto: StopDto) {
     const s = await this.access.assertSession(p, id);
     if (s.status === 'STOPPED') return this.view(id);
-    const pending = await this.prisma.command.findMany({ where: { sessionId: id, status: { in: ['REQUESTED', 'QUEUED', 'DISPATCHED'] } }, select: { id: true } });
+    const reason = `session stopped: ${dto.reason}`;
     await this.prisma.$transaction([
       this.prisma.sleepSession.update({ where: { id }, data: { status: 'STOPPED', endedAt: new Date(), endReason: dto.reason } }),
-      // 미완료 명령은 전부 취소 — 재연결 시 재생 금지
-      this.prisma.command.updateMany({ where: { id: { in: pending.map((c) => c.id) } }, data: { status: 'CANCELLED', reason: `session stopped: ${dto.reason}` } }),
+      // 미완료 명령은 전부 취소 — 재연결 시 재생 금지. id 목록이 아니라 상태로 골라야 직전에 생긴 명령도 빠지지 않는다
+      this.prisma.command.updateMany({ where: { sessionId: id, status: { in: ['REQUESTED', 'QUEUED', 'DISPATCHED'] } }, data: { status: 'CANCELLED', reason } }),
     ]);
-    for (const c of pending) this.events.publish({ type: 'COMMAND_STATUS_CHANGED', aggregateId: s.vehicleId, executionMode: s.executionMode, payload: { commandId: c.id, status: 'CANCELLED', observed: null, reason: `session stopped: ${dto.reason}` } });
+    const cancelled = await this.prisma.command.findMany({ where: { sessionId: id, status: 'CANCELLED', reason }, select: { id: true } });
+    for (const c of cancelled) this.events.publish({ type: 'COMMAND_STATUS_CHANGED', aggregateId: s.vehicleId, executionMode: s.executionMode, payload: { commandId: c.id, status: 'CANCELLED', observed: null, reason } });
     this.events.publish({ type: 'PLAN_UPDATED', aggregateId: s.vehicleId, revision: s.planVersion, executionMode: s.executionMode, payload: { sessionId: id, status: 'STOPPED', reason: dto.reason, by: p.kind } });
     return this.view(id);
   }

@@ -8,7 +8,7 @@ import { DevicePrincipal, UserPrincipal } from '../auth/principal';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export type ModelMock = Record<string, jest.Mock>;
-export type PrismaMock = Record<string, ModelMock> & { $transaction: jest.Mock };
+export type PrismaMock = Record<string, ModelMock> & { $transaction: jest.Mock; lock: jest.Mock };
 
 /**
  * prisma.<model>.<method> 를 처음 접근할 때 jest.fn() 을 만들어 준다.
@@ -22,6 +22,7 @@ export function createPrismaMock(): PrismaMock {
     get(_t, key: string | symbol) {
       if (typeof key === 'symbol' || key === 'then') return undefined;
       if (key === '$transaction') return transaction;
+      if (key === 'lock') return lock;
       if (!models.has(key)) {
         models.set(
           key,
@@ -36,7 +37,28 @@ export function createPrismaMock(): PrismaMock {
       return models.get(key);
     },
   });
-  const transaction = jest.fn(async (arg: unknown) => (typeof arg === 'function' ? (arg as (tx: unknown) => unknown)(prisma) : Promise.all(arg as unknown[])));
+  // PrismaService.lock(tx, key) = pg_advisory_xact_lock: 같은 key 는 트랜잭션이 끝날 때까지 직렬화한다
+  const held = new Map<string, Promise<void>>();
+  const releases = new WeakMap<object, (() => void)[]>();
+  const lock = jest.fn(async (tx: object, key: string) => {
+    const prev = held.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => (release = r));
+    held.set(key, prev.then(() => mine));
+    const list = releases.get(tx);
+    if (list) list.push(release); else release();
+    await prev;
+  });
+  const transaction = jest.fn(async (arg: unknown) => {
+    if (typeof arg !== 'function') return Promise.all(arg as unknown[]);
+    const tx = new Proxy(prisma, {}); // 트랜잭션마다 다른 tx (같은 mock 을 가리킴)
+    releases.set(tx, []);
+    try {
+      return await (arg as (tx: unknown) => unknown)(tx);
+    } finally {
+      releases.get(tx)!.forEach((r) => r());
+    }
+  });
   return prisma as PrismaMock;
 }
 

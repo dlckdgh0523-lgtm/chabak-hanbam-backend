@@ -212,6 +212,12 @@ describe('SessionsService', () => {
     beforeEach(() => {
       access.assertSession.mockResolvedValue(session({ status: 'PREFLIGHT' }));
       prisma.preflight.findFirst.mockResolvedValue(readyPf());
+      // [백엔드 수정] start 는 최신 상태로 안전 규칙을 다시 평가하고(아래 5번), 상태 조건부 updateMany 로 ACTIVE 로 바꾼다(7번 동시 시작).
+      //   그래서 preflight 와 같은 조회 mock 이 필요하다.
+      prisma.vehicle.findUniqueOrThrow.mockResolvedValue({ id: 'vehicle-1', powertrain: 'EV' });
+      prisma.trip.findUniqueOrThrow.mockResolvedValue({ id: 'trip-1', userId: 'user-1' });
+      prisma.consentEvent.findMany.mockResolvedValue([{ purpose: 'VEHICLE_STATE', decision: 'GRANTED' }]);
+      prisma.sleepSession.updateMany.mockResolvedValue({ count: 1 });
     });
 
     // 의도: 자동 관리는 사용자가 직접 확인 버튼을 눌러야 시작한다.
@@ -247,7 +253,8 @@ describe('SessionsService', () => {
     // 의도: 차량은 이 이벤트를 받고 로컬 재검증 후에만 자동 관리를 시작한다.
     it('4. 성공하면 ACTIVE 가 되고 PLAN_UPDATED 이벤트를 보낸다', async () => {
       await service.start(userPrincipal(), 's-1', dto);
-      expect(prisma.sleepSession.update).toHaveBeenCalledWith({ where: { id: 's-1' }, data: { status: 'ACTIVE', startedAt: expect.any(Date) } });
+      // [백엔드 수정] update → 상태 조건부 updateMany. 확인과 변경 사이에 다른 요청이 끼어도 두 번 ACTIVE 가 되지 않는다.
+      expect(prisma.sleepSession.updateMany).toHaveBeenCalledWith({ where: { id: 's-1', planVersion: 1, status: { in: ['PLANNED', 'PREFLIGHT'] } }, data: { status: 'ACTIVE', startedAt: expect.any(Date) } });
       expect(events.publish).toHaveBeenCalledWith(expect.objectContaining({ type: 'PLAN_UPDATED', payload: expect.objectContaining({ status: 'ACTIVE', userActionId: 'act-1' }) }));
     });
 
@@ -256,6 +263,7 @@ describe('SessionsService', () => {
       vehicles.getState.mockResolvedValue({ revision: 6, connection: 'ONLINE', metrics: { ...safeMetrics, evSocPct: ok(10) } });
       await expectApiError(service.start(userPrincipal(), 's-1', dto), 'PRECONDITION_FAILED', 422);
       expect(prisma.sleepSession.update).not.toHaveBeenCalled();
+      expect(prisma.sleepSession.updateMany).not.toHaveBeenCalled();
     });
 
     // 의도: 센서는 5초마다 값을 올려 revision 이 계속 오른다. revision 이 정확히 같아야 시작할 수 있으면 센서가 있는 한 시작이 거의 불가능하다.
@@ -279,11 +287,15 @@ describe('SessionsService', () => {
 
       await expect(service.start(userPrincipal(), 's-1', dto)).rejects.toBeDefined();
       expect(prisma.sleepSession.update).not.toHaveBeenCalled();
+      expect(prisma.sleepSession.updateMany).not.toHaveBeenCalled();
     });
   });
 
   // ── 7.4 종료 ─────────────────────────────────────────────────
   describe('7.4 종료 stop', () => {
+    // [백엔드 수정] stop 은 취소한 명령을 다시 조회해 COMMAND_STATUS_CHANGED 를 보낸다(8.3-2). 실제 findMany 는 undefined 를 주지 않는다.
+    beforeEach(() => prisma.command.findMany.mockResolvedValue([]));
+
     // 의도: 사용자와 차량이 동시에 종료해도 종료 처리와 이벤트는 한 번만.
     it('1. 이미 STOPPED 면 아무것도 바꾸지 않고 그대로 응답한다', async () => {
       access.assertSession.mockResolvedValue(session({ status: 'STOPPED' }));

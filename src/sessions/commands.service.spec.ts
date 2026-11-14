@@ -50,7 +50,9 @@ describe('CommandsService', () => {
         ['PLEOS_EMULATOR', 'REQUEST_FRESH_AIR', true],
         ['REAL', 'SET_CLIMATE_TARGET', false],
       ] as const)('%s 모드에서 %s 허용=%s', async (mode, type, allowed) => {
-        const req = service.request(userPrincipal(), 'vehicle-1', dto({ executionMode: mode, action: { type, areaId: 'ROW_1_LEFT', fanLevel: 3 } }));
+        // [백엔드 수정] 명령별 허용 필드만 받는다(8.1-9). 모든 type 에 areaId+fanLevel 을 섞어 보내면 400 이라, type 별 올바른 action 을 쓴다.
+        const action = { LOCK_DOOR: { type, areaId: 'ROW_1_LEFT' }, REQUEST_FRESH_AIR: { type, fanLevel: 3 }, SET_CLIMATE_TARGET: { type, targetTempC: 20, areaId: 'ROW_1_LEFT' } }[type];
+        const req = service.request(userPrincipal(), 'vehicle-1', dto({ executionMode: mode, action }));
         if (allowed) await expect(req).resolves.toMatchObject({ status: 'DISPATCHED' });
         else {
           const err = await expectApiError(req, 'UNSUPPORTED_CAPABILITY', 422);
@@ -75,6 +77,17 @@ describe('CommandsService', () => {
       await expectApiError(service.request(userPrincipal(), 'vehicle-1', dto({ expiresAt: new Date(T0).toISOString() })), 'VALIDATION_FAILED', 400);
     });
 
+    // [백엔드 추가] 오프라인 차량이 몇 시간 뒤 재접속해 옛 공조·잠금 명령을 실행하지 않게 상한 10분.
+    it('3. expiresAt 이 10분보다 멀면 400', async () => {
+      await expectApiError(service.request(userPrincipal(), 'vehicle-1', dto({ expiresAt: new Date(T0 + 10 * 60_000 + 1).toISOString() })), 'VALIDATION_FAILED', 400);
+      await expect(service.request(userPrincipal(), 'vehicle-1', dto({ expiresAt: new Date(T0 + 10 * 60_000).toISOString() }))).resolves.toMatchObject({ status: 'DISPATCHED' });
+    });
+
+    // [백엔드 추가] 정의되지 않은 필드가 저장되고 차량에 그대로 전달되지 않게.
+    it('8.1-9. action 에 정의되지 않은 필드가 있으면 400', async () => {
+      await expectApiError(service.request(userPrincipal(), 'vehicle-1', dto({ action: { type: 'SET_CLIMATE_TARGET', targetTempC: 20, areaId: 'ROW_1_LEFT', extra: 1 } as never })), 'VALIDATION_FAILED', 400);
+    });
+
     // 의도: 아직 검사 전이거나 이미 끝난 세션에 묶인 명령은 실행되면 안 된다.
     it.each(['PLANNED', 'STOPPED'])('4. sessionId 를 줬는데 세션이 %s 이면 422', async (status) => {
       access.assertSession.mockResolvedValue({ id: 's-1', status });
@@ -94,8 +107,10 @@ describe('CommandsService', () => {
     });
 
     // 의도: 사용자가 본 상태와 지금 상태가 다르면, 그 상태를 기준으로 만든 명령은 맞지 않을 수 있다.
-    it('5. expectedStateRevision 이 서버 값과 다르면 422', async () => {
-      await expectApiError(service.request(userPrincipal(), 'vehicle-1', dto({ expectedStateRevision: 4 })), 'PRECONDITION_FAILED', 422);
+    // [백엔드 수정] 원래 "서버 값과 다르면(4 vs 5) 422" 였는데, 바로 아래 6번은 "클라이언트 5 / 서버 9 면 통과" 를 요구해 두 테스트가 동시에 통과할 수 없다.
+    //   6번(데모 치명)을 따르고, 서버에 없는 미래 revision(클라이언트가 앞섬)만 거부한다. 실행 직전 안전 검사는 차량이 한다.
+    it('5. expectedStateRevision 이 서버 값보다 앞서면 422', async () => {
+      await expectApiError(service.request(userPrincipal(), 'vehicle-1', dto({ expectedStateRevision: 6 })), 'PRECONDITION_FAILED', 422);
     });
 
     // 의도: 차량 기능이 바뀐 뒤 옛 기능 기준으로 만든 명령을 막는다.

@@ -174,12 +174,23 @@ describe('PairingService', () => {
     // 의도: 연결만 끊고 토큰이 살아 있으면, 해제된 차량 앱이 계속 서버에 접근한다.
     it('1. 연결을 REVOKED 로 바꾸고 장치 토큰을 폐기한다', async () => {
       prisma.vehicleLink.findFirst.mockResolvedValue({ id: 'link-1', userId: 'user-1', deviceId: 'car-1', vehicleId: 'vehicle-1' });
+      prisma.vehicleLink.count.mockResolvedValue(0); // [백엔드 수정] 그 차량 장치에 남은 ACTIVE 연결 없음 (아래 1-1 과 구분)
 
       await service.revokeLink(userPrincipal('user-1'), 'link-1');
 
       expect(prisma.vehicleLink.update).toHaveBeenCalledWith({ where: { id: 'link-1' }, data: { status: 'REVOKED', revokedAt: expect.any(Date) } });
       expect(prisma.device.update).toHaveBeenCalledWith({ where: { id: 'car-1' }, data: { revokedAt: expect.any(Date), tokenHash: null } });
       expect(events.publish).toHaveBeenCalledWith(expect.objectContaining({ type: 'LINK_HEALTH_CHANGED', payload: { linkId: 'link-1', status: 'REVOKED' } }));
+    });
+
+    // [백엔드 결정] 같은 차량 장치에 다른 사용자의 ACTIVE 연결이 남아 있으면 장치 토큰은 살린다. 한 명이 해제했다고 공동 사용자까지 끊기면 안 된다.
+    it('1-1. 다른 사용자의 ACTIVE 연결이 남아 있으면 연결만 REVOKED 로 바꾸고 장치 토큰은 유지한다', async () => {
+      prisma.vehicleLink.findFirst.mockResolvedValue({ id: 'link-1', userId: 'user-1', deviceId: 'car-1', vehicleId: 'vehicle-1' });
+      prisma.vehicleLink.count.mockResolvedValue(1);
+      await service.revokeLink(userPrincipal('user-1'), 'link-1');
+      expect(prisma.vehicleLink.update).toHaveBeenCalledWith({ where: { id: 'link-1' }, data: { status: 'REVOKED', revokedAt: expect.any(Date) } });
+      expect(prisma.vehicleLink.count).toHaveBeenCalledWith({ where: { deviceId: 'car-1', status: 'ACTIVE' } });
+      expect(prisma.device.update).not.toHaveBeenCalled();
     });
 
     // 의도: 남의 연결을 끊어 차량 감시를 멈추게 하는 것을 막는다.

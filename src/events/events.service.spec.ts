@@ -20,7 +20,7 @@ describe('EventsService (10.1 이벤트 저장, 전파)', () => {
     jest.useFakeTimers({ now: T0, doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
     prisma = createPrismaMock();
     prisma.outboxEvent.create.mockResolvedValue({});
-    events = new EventsService(prisma as unknown as PrismaService, createConfig());
+    events = new EventsService(prisma as unknown as PrismaService); // [백엔드 수정] 쓰지 않던 ConfigService 인자 제거
   });
   afterEach(() => {
     events.onModuleDestroy();
@@ -104,6 +104,7 @@ describe('EventsGateway (10.2 WebSocket 접속, 10.3 재전송)', () => {
   let events: { bus: { on: jest.Mock }; replaySince: jest.Mock };
   let gateway: EventsGateway;
   let onEvent: (env: Envelope) => void;
+  let onRevoked: (r: { principals: string[]; vehicleId?: string }) => void;
 
   const fakeWs = () => ({ send: jest.fn(), close: jest.fn(), readyState: WebSocket.OPEN }) as unknown as WebSocket & { send: jest.Mock; close: jest.Mock };
   const connect = async (query: string) => {
@@ -116,9 +117,12 @@ describe('EventsGateway (10.2 WebSocket 접속, 10.3 재전송)', () => {
   beforeEach(() => {
     prisma = createPrismaMock();
     tokens = new TokenService(new JwtService(), createConfig());
-    events = { bus: { on: jest.fn((_e, fn) => (onEvent = fn)) }, replaySince: jest.fn().mockResolvedValue([]) };
+    // [백엔드 수정] 게이트웨이가 'event' 외에 'revoked' 도 구독하므로 이벤트 이름으로 구분해 잡는다
+    events = { bus: { on: jest.fn((e, fn) => (e === 'revoked' ? (onRevoked = fn) : (onEvent = fn))) }, replaySince: jest.fn().mockResolvedValue([]) };
     gateway = new EventsGateway(prisma as unknown as PrismaService, tokens, events as unknown as EventsService);
     gateway.afterInit();
+    // [백엔드 수정] 접속 시 HTTP AuthGuard 와 같이 사용자 행을 확인한다(없거나 탈퇴면 4401, 아래 5번). 정상 사용자 기본값.
+    prisma.user.findUnique.mockResolvedValue({ id: 'user-1', deletionRequestedAt: null });
   });
 
   // 의도: WebSocket 은 HTTP guard 를 거치지 않으므로 여기서 따로 인증한다.
@@ -172,6 +176,16 @@ describe('EventsGateway (10.2 WebSocket 접속, 10.3 재전송)', () => {
     expect(sent(ws).map((m) => m.eventId)).toEqual(['e-mine']);
   });
 
+  // [백엔드 추가] 연결 해제·탈퇴·센서 재발급 뒤에도 이미 열린 소켓이 그 차량 이벤트를 계속 받으면 안 된다.
+  it('3. 폐기(revoked) 신호를 받으면 해당 소켓을 4401 로 닫는다. vehicleId 가 있으면 그 차량 방만', async () => {
+    prisma.vehicleLink.findFirst.mockResolvedValue({ id: 'link-1' });
+    const v1 = await connect(`token=${tokens.signUserAccess('user-1')}&vehicleId=vehicle-1`);
+    const v2 = await connect(`token=${tokens.signUserAccess('user-1')}&vehicleId=vehicle-2`);
+    onRevoked({ principals: ['USER:user-1'], vehicleId: 'vehicle-1' });
+    expect(v1.close).toHaveBeenCalledWith(4401, expect.any(String));
+    expect(v2.close).not.toHaveBeenCalled();
+  });
+
   // 의도: 끊긴 소켓에 보내다 오류가 나지 않게.
   it('3. 연결이 끊긴 클라이언트에는 보내지 않는다', async () => {
     prisma.vehicleLink.findFirst.mockResolvedValue({ id: 'link-1' });
@@ -184,7 +198,14 @@ describe('EventsGateway (10.2 WebSocket 접속, 10.3 재전송)', () => {
 
   // 의도: HTTP 는 페어링 전 차량 앱의 자기 차량 접근을 허용하는데(QR 생성 등), WebSocket 은 ACTIVE 연결만 본다.
   //       페어링 전에 PAIRING_CLAIMED 를 실시간으로 받아야 하는지 정해지지 않아 todo 로 둔다.
-  it.todo('4. (확인 필요) 페어링 전 자동차 장치도 자기 차량 방에 접속할 수 있어야 하는가 — 현재 HTTP 는 허용, WebSocket 은 4403');
+  // [백엔드 결정] 막는다(현재 동작 유지). 페어링 전에는 실시간으로 받을 이벤트가 없고, 차량 앱은 HTTP 로 QR 생성·confirm 을 한다.
+  it('4. 페어링 전(ACTIVE 연결 없음) 자동차 장치는 차량 방에 접속할 수 없다 (4403)', async () => {
+    prisma.device.findUnique.mockResolvedValue({ id: 'car-1', type: 'CAR', userId: null, revokedAt: null });
+    prisma.vehicleLink.findFirst.mockResolvedValue(null);
+    const ws = await connect('token=dvt_x&vehicleId=vehicle-1');
+    expect(ws.close).toHaveBeenCalledWith(4403, expect.any(String));
+    expect(prisma.vehicleLink.findFirst).toHaveBeenCalledWith({ where: { deviceId: 'car-1', vehicleId: 'vehicle-1', status: 'ACTIVE' } });
+  });
 
   // 의도: HTTP 는 탈퇴하면 바로 막히는데 WebSocket 만 열려 있으면 탈퇴 후에도 차량 이벤트를 계속 받는다.
   it('5. 탈퇴한 사용자의 JWT 로는 접속할 수 없다', async () => {

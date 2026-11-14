@@ -2,7 +2,8 @@ import { JwtService } from '@nestjs/jwt';
 import { AccountService } from './account.service';
 import { TokenService } from '../auth/token.service';
 import { PrismaService } from '../prisma/prisma.service';
-import { carPrincipal, createConfig, createPrismaMock, expectApiError, PrismaMock, userPrincipal } from '../testing/helpers';
+import { EventsService } from '../events/events.service';
+import { carPrincipal, createConfig, createEventsMock, createPrismaMock, expectApiError, PrismaMock, userPrincipal } from '../testing/helpers';
 
 type ContactRow = { id: string; userId: string; priority: number; nameEncrypted: string; phoneEncrypted: string; version: number };
 
@@ -19,7 +20,8 @@ describe('AccountService', () => {
     prisma = createPrismaMock();
     const cfg = createConfig();
     tokens = new TokenService(new JwtService(), cfg);
-    service = new AccountService(prisma as unknown as PrismaService, cfg, tokens);
+    // [백엔드 수정] 폐기 시 열린 WebSocket 을 끊으려고 EventsService 를 받는다
+    service = new AccountService(prisma as unknown as PrismaService, cfg, tokens, createEventsMock() as unknown as EventsService);
 
     // 비상연락처는 암호화 → 복호화까지 확인하려고 메모리 저장소로 흉내낸다
     contacts = [];
@@ -27,9 +29,15 @@ describe('AccountService', () => {
     prisma.emergencyContact.findMany.mockImplementation(async ({ where }) =>
       contacts.filter((c) => c.userId === where.userId && (!where.id || where.id.in.includes(c.id))).sort((a, b) => a.priority - b.priority),
     );
+    // [백엔드 수정] 연락처 버전은 사용자 행의 카운터(contactsVersion)이고, 기존 id 는 update 로 유지한다. 그에 맞춰 user·update·notIn 을 흉내낸다.
+    const users = new Map<string, { contactsVersion: number; smsQuotaDay: string | null; smsQuotaUsed: number }>();
+    const user = (id: string) => users.get(id) ?? users.set(id, { contactsVersion: 0, smsQuotaDay: null, smsQuotaUsed: 0 }).get(id)!;
+    prisma.user.findUniqueOrThrow.mockImplementation(async ({ where }) => ({ ...user(where.id) }));
+    prisma.user.update.mockImplementation(async ({ where, data }) => Object.assign(user(where.id), data));
     prisma.emergencyContact.deleteMany.mockImplementation(async ({ where }) => {
-      contacts = contacts.filter((c) => c.userId !== where.userId);
+      contacts = contacts.filter((c) => c.userId !== where.userId || (where.id?.notIn ?? []).includes(c.id));
     });
+    prisma.emergencyContact.update.mockImplementation(async ({ where, data }) => Object.assign(contacts.find((c) => c.id === where.id)!, data));
     prisma.emergencyContact.create.mockImplementation(async ({ data }) => {
       const row = { id: `c-${++seq}`, ...data };
       contacts.push(row);
@@ -78,6 +86,7 @@ describe('AccountService', () => {
     });
 
     // 의도: 부분 수정이 아니라 전체 교체라서, 화면에서 지운 연락처가 서버에 남지 않는다.
+    // [백엔드 수정] 목록에서 빠진 연락처는 지우고, id 없이 온 것은 새로 만든다. (id 를 보내면 유지 — 아래 2-1)
     it('2. 연락처 전체를 교체한다 (기존 것을 지우고 새로 만든다)', async () => {
       await service.putContacts('user-1', two, 0);
       const res = await service.putContacts('user-1', [{ name: '친구', phone: '01011112222' }], 1);
@@ -100,6 +109,29 @@ describe('AccountService', () => {
       expect(contacts).toHaveLength(2);
     });
 
+    // [백엔드 추가] id 가 매번 바뀌면 SMS 기록의 contact:<id> 가 끊기고 클라이언트가 연락처를 추적할 수 없다.
+    //   프론트(contacts.update)는 이름만 바꿀 때 phone 을 보내지 않는다.
+    it('2-1. 기존 id 를 보내면 id 를 유지하고, phone 을 생략하면 번호도 유지한다. 순서도 바꿀 수 있다', async () => {
+      const saved = await service.putContacts('user-1', two, 0);
+      const [mom, dad] = saved.contacts;
+      const res = await service.putContacts('user-1', [{ id: dad.id, name: '아버지' }, { id: mom.id, name: '엄마', phone: '010-1111-2222' }], 1);
+      expect(res.contacts.map((c) => [c.id, c.priority, c.name, c.maskedPhone])).toEqual([[dad.id, 1, '아버지', dad.maskedPhone], [mom.id, 2, '엄마', '***-****-2222']]);
+    });
+
+    // [백엔드 추가] 새 연락처는 번호가 필수다.
+    it('2-1. id 없이(또는 모르는 id 로) 번호를 빼면 400 이고 아무것도 바꾸지 않는다', async () => {
+      await service.putContacts('user-1', two, 0);
+      await expectApiError(service.putContacts('user-1', [{ id: 'c-unknown', name: '누구' }], 1), 'VALIDATION_FAILED', 400);
+      expect(contacts).toHaveLength(2);
+    });
+
+    // [백엔드 추가] 버전이 "남은 행의 최대 version" 이면 빈 목록 저장 후 0 으로 돌아가, 그 전에 버전 0 을 본 오래된 화면이 최신 목록을 덮어쓴다(ABA).
+    it('2-2. 빈 목록으로 저장해도 버전은 계속 오른다 (0 으로 돌아가지 않는다)', async () => {
+      await service.putContacts('user-1', two, 0);
+      expect((await service.putContacts('user-1', [], 1)).version).toBe(2);
+      await expectApiError(service.putContacts('user-1', two, 0), 'VERSION_CONFLICT', 409);
+    });
+
     // 의도: 위급 시 SMS 를 보낼 순서다.
     it('3. 입력한 배열 순서대로 우선순위(1부터)가 된다', async () => {
       const res = await service.putContacts('user-1', two, 0);
@@ -117,8 +149,9 @@ describe('AccountService', () => {
     it('2. 전화번호는 마지막 4자리만 보여준다 (하이픈 등 형식은 유지)', async () => {
       await service.putContacts('user-1', [{ name: '엄마', phone: '010-1234-5678' }, { name: '아빠', phone: '+821098765432' }], 0);
       const res = await service.getContacts('user-1');
-      expect(res.contacts[0].phoneMasked).toBe('***-****-5678');
-      expect(res.contacts[1].phoneMasked).toBe('+********5432');
+      // [백엔드 수정] 프론트 계약(events.json Contact.maskedPhone) 이름으로 맞춤
+      expect(res.contacts[0].maskedPhone).toBe('***-****-5678');
+      expect(res.contacts[1].maskedPhone).toBe('+********5432');
       expect(JSON.stringify(res)).not.toContain('1234');
     });
 
@@ -141,6 +174,13 @@ describe('AccountService', () => {
       await service.putContacts('user-1', [{ name: '엄마', phone: '01012345678' }], 0);
       const res = await service.testSms('user-1', contacts[0].id, 'act-1');
       expect(res).toMatchObject({ jobId: expect.any(String), stage: 'ACCEPTED_BY_PROVIDER', note: expect.stringContaining('not delivery') });
+    });
+
+    // [백엔드 추가] 연락처에는 아무 번호나 넣을 수 있다. 횟수 제한이 없으면 문자 폭탄·비용 악용 통로가 된다(경보 SMS 와 합산 하루 20건).
+    it('4. 사용자당 하루 20건을 넘으면 429', async () => {
+      await service.putContacts('user-1', [{ name: '엄마', phone: '01012345678' }], 0);
+      for (let i = 0; i < 20; i++) await service.testSms('user-1', contacts[0].id, `act-${i}`);
+      await expectApiError(service.testSms('user-1', contacts[0].id, 'act-21'), 'RATE_LIMITED', 429);
     });
   });
 
@@ -196,6 +236,9 @@ describe('AccountService', () => {
   });
 
   describe('4.3.2 센서 토큰 발급 issueSensorToken', () => {
+    // [백엔드 수정] 발급은 차량 락 안에서 기존 센서 연결을 조회해 폐기한다. 실제 findMany 는 undefined 를 주지 않는다.
+    beforeEach(() => prisma.vehicleLink.findMany.mockResolvedValue([]));
+
     // 의도: 연결되지 않은 차량에 센서를 붙여 남의 차량 상태값을 오염시키지 못하게.
     it('1. 요청한 사용자가 해당 차량에 ACTIVE 연결이 없으면 404', async () => {
       prisma.vehicleLink.findFirst.mockResolvedValue(null);
@@ -345,8 +388,16 @@ describe('AccountService', () => {
       //      "ACTIVE 세션 중에는 재발급 422" 또는 "확인을 받은 뒤에만 교체" 중에 정해야 한다.
       // 4-5: 센서 폰이 하나뿐이라 그 폰이 꺼지면 CO/CO₂ 감시가 전부 멈춘다. 서버만으로는 해결되지 않는 문제다
       //      (차량 앱 경보, 사용자 안내).
-      it.todo('4-3. (확인 필요) ACTIVE 세션이 있는 동안 센서 토큰 재발급을 막는가');
-      it.todo('4-5. (확인 필요) 센서 폰 단절 시 차량 앱 경보로 보완하는가');
+      // [백엔드 결정] 막는다(422). 교체하려면 세션을 끝내고 다시 시작한다. 자는 동안 감시 중인 센서가 조용히 다른 폰으로 바뀌지 않게.
+      it('4-3. ACTIVE 세션이 있는 동안에는 센서 토큰을 발급하지 않고(422) 기존 센서도 그대로 둔다', async () => {
+        const first = await service.issueSensorToken(userPrincipal('user-1'), 'vehicle-1');
+        prisma.sleepSession.findFirst.mockResolvedValue({ id: 's-1' });
+        await expectApiError(service.issueSensorToken(userPrincipal('user-1'), 'vehicle-1'), 'PRECONDITION_FAILED', 422);
+        expect(prisma.sleepSession.findFirst).toHaveBeenCalledWith({ where: { vehicleId: 'vehicle-1', status: 'ACTIVE' }, select: { id: true } });
+        expect(activeSensorLinks().map((l) => l.deviceId)).toEqual([first.deviceId]);
+      });
+      // [백엔드 결정] 4-5: 서버는 SENSOR_DISCONNECTED 를 차량 방(WSS)으로도 보내고, 재시작 후에도 감시를 다시 건다.
+      //   테스트는 alerts.service.spec.ts '4.3.2-4-5' 에 있다. 차량 앱 자체 경보는 차량 앱 담당.
     });
   });
 
@@ -354,7 +405,11 @@ describe('AccountService', () => {
   describe('4.4 계정 삭제 requestDeletion', () => {
     beforeEach(() => {
       prisma.user.findUniqueOrThrow.mockResolvedValue({ id: 'user-1', authSubject: 'dev:alice' });
+      prisma.vehicleLink.findMany.mockResolvedValue([{ deviceId: 'car-1' }]);
+      prisma.vehicleLink.count.mockResolvedValue(0); // 기본: 그 차량에 남은 사용자 없음
+      prisma.device.findMany.mockResolvedValue([{ id: 'phone-1' }, { id: 'car-1' }]);
     });
+    const devicesWhere = () => prisma.device.findMany.mock.calls[0][0].where;
 
     // 의도: 잠깐 빌린 폰이나 열려 있는 앱으로 남이 계정을 삭제하지 못하게, 삭제 직전에 다시 인증한다.
     it('1. 재인증(dev:{reauth})이 맞지 않으면 401 이고 아무것도 바꾸지 않는다', async () => {
@@ -370,19 +425,25 @@ describe('AccountService', () => {
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
       expect(prisma.user.update).toHaveBeenCalledWith({ where: { id: 'user-1' }, data: { deletionRequestedAt: expect.any(Date) } });
       expect(prisma.vehicleLink.updateMany).toHaveBeenCalledWith({ where: { userId: 'user-1', status: 'ACTIVE' }, data: { status: 'REVOKED', revokedAt: expect.any(Date) } });
-      expect(prisma.device.updateMany).toHaveBeenCalledWith({ where: { userId: 'user-1' }, data: { revokedAt: expect.any(Date), tokenHash: null, pushTokenEncrypted: null } });
+      // [백엔드 수정] userId 전체가 아니라 "본인 폰·센서 + 남은 사용자가 없는 차량 장치" 만 폐기한다 (아래 3번)
+      expect(prisma.device.updateMany).toHaveBeenCalledWith({ where: { id: { in: ['phone-1', 'car-1'] } }, data: { revokedAt: expect.any(Date), tokenHash: null, pushTokenEncrypted: null } });
       expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({ where: { userId: 'user-1' }, data: { revokedAt: expect.any(Date) } });
       expect(prisma.emergencyContact.deleteMany).toHaveBeenCalledWith({ where: { userId: 'user-1' } });
     });
 
     // 의도: confirm 할 때 CAR 장치의 userId 가 그 사용자로 설정된다. 탈퇴자 이름으로 차량 앱이 계속 동작하지 않게 한다.
     //       단, 같은 차량에 연결된 다른 사용자도 차량 앱을 못 쓰게 되는 부작용이 있어 팀원 확인이 필요한 항목이다.
-    it('3. 계정을 삭제하면 그 사용자가 페어링한 자동차 장치의 토큰도 폐기된다', async () => {
+    // [백엔드 결정] 그 차량을 쓰는 다른 사용자가 없을 때만 자동차 장치 토큰을 폐기한다. 한 명이 탈퇴했다고 공동 사용자의 차량 앱까지 끊기면 안 된다.
+    it('3. 계정을 삭제하면 그 사용자가 페어링한 자동차 장치의 토큰도 폐기된다 (그 차량에 남은 사용자가 없을 때)', async () => {
       await service.requestDeletion('user-1', 'alice');
-      // confirm 시 CAR 장치의 userId 가 그 사용자로 설정된다 (pairing.service). userId 조건이면 CAR 장치도 포함된다.
-      const { where, data } = prisma.device.updateMany.mock.calls[0][0];
-      expect(where).toEqual({ userId: 'user-1' });
-      expect(data).toMatchObject({ revokedAt: expect.any(Date), tokenHash: null });
+      expect(prisma.vehicleLink.count).toHaveBeenCalledWith({ where: { deviceId: 'car-1', status: 'ACTIVE' } });
+      expect(devicesWhere()).toEqual({ OR: [{ userId: 'user-1', type: { not: 'CAR' } }, { id: { in: ['car-1'] } }] });
+    });
+
+    it('3. 같은 차량에 ACTIVE 연결이 남은 사용자가 있으면 자동차 장치 토큰은 폐기하지 않는다', async () => {
+      prisma.vehicleLink.count.mockResolvedValue(1);
+      await service.requestDeletion('user-1', 'alice');
+      expect(devicesWhere()).toEqual({ OR: [{ userId: 'user-1', type: { not: 'CAR' } }, { id: { in: [] } }] });
     });
   });
 });

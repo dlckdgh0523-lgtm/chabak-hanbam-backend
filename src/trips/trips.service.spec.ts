@@ -183,12 +183,15 @@ describe('TripsService', () => {
       const all = Array.from({ length: 25 }, (_, i) =>
         tripRow({ id: `t-${String(i).padStart(2, '0')}`, startAt: new Date(Date.UTC(2026, 11, 30 - i)) }),
       );
-      prisma.trip.findMany.mockImplementation(async ({ where, take }) =>
-        all
+      // [백엔드 수정] Prisma 커서 의미(정렬한 뒤 cursor 행부터, skip 만큼 건너뜀)를 흉내 낸다.
+      //   원래 mock 은 where.id.gt 만 이해해서, 정렬 키로 자르는 cursor+skip 구현을 표현하지 못했다.
+      prisma.trip.findMany.mockImplementation(async ({ where, take, cursor, skip = 0 }) => {
+        const sorted = all
           .filter((t) => !where.id || (t.id as string) > where.id.gt)
-          .sort((a, b) => (a.startAt as Date).getTime() - (b.startAt as Date).getTime() || (a.id as string).localeCompare(b.id as string))
-          .slice(0, take),
-      );
+          .sort((a, b) => (a.startAt as Date).getTime() - (b.startAt as Date).getTime() || (a.id as string).localeCompare(b.id as string));
+        const from = cursor ? sorted.findIndex((t) => t.id === cursor.id) : 0;
+        return sorted.slice(from + skip, from + skip + take);
+      });
 
       const seen: string[] = [];
       let cursor: string | undefined;

@@ -68,6 +68,7 @@ export class VehiclesService {
     const receivedAt = new Date();
     let accepted = 0, duplicates = 0;
     const latest = new Map<string, Observation>();
+    const sentAt = new Map<string, number>(); // 묶음 안 순서는 고정 전 시각으로 판단 (미래 값끼리도 순서 유지)
 
     for (const s of dto.samples) {
       this.assertModeAllowed(s.source === 'MOCK' ? 'MOCK' : 'REAL');
@@ -92,8 +93,8 @@ export class VehiclesService {
         value: s.value ?? null, unit: s.unit, source: s.source, sourceDeviceId: p.deviceId, observedAt: observedAt.toISOString(),
         receivedAt: receivedAt.toISOString(), quality, seq: s.seq, bootId: s.bootId,
       };
-      const prev = latest.get(s.metric);
-      if (!prev || Date.parse(prev.observedAt) <= observedAt.getTime()) latest.set(s.metric, obs);
+      const prev = sentAt.get(s.metric);
+      if (prev === undefined || prev <= Date.parse(s.observedAt)) { latest.set(s.metric, obs); sentAt.set(s.metric, Date.parse(s.observedAt)); }
     }
 
     if (latest.size) {
