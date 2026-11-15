@@ -29,6 +29,8 @@ export class TripsService {
 
   async patch(p: UserPrincipal, id: string, dto: PatchTripDto) {
     const t = await this.access.assertTrip(p, id);
+    if (t.status === 'CANCELLED') throw new ApiError('PRECONDITION_FAILED', 'trip is CANCELLED');
+    if ((dto.endAt ? Date.parse(dto.endAt) : t.endAt.getTime()) <= (dto.startAt ? Date.parse(dto.startAt) : t.startAt.getTime())) throw new ApiError('VALIDATION_FAILED', 'endAt must be after startAt');
     // 폰·차가 동시에 수정해도 조용히 덮어쓰지 않는다
     const r = await this.prisma.trip.updateMany({
       where: { id, version: dto.expectedVersion },
@@ -47,8 +49,8 @@ export class TripsService {
     await this.access.assertVehicle(p, vehicleId);
     const take = 20;
     const rows = await this.prisma.trip.findMany({
-      where: { vehicleId, status: { in: ['PLANNED', 'ACTIVE'] }, endAt: { gte: new Date(Date.now() - 6 * 3600_000) }, ...(cursor ? { id: { gt: cursor } } : {}) },
-      orderBy: [{ startAt: 'asc' }, { id: 'asc' }], take: take + 1, include: { place: true, syncs: true },
+      where: { vehicleId, status: { in: ['PLANNED', 'ACTIVE'] }, endAt: { gte: new Date(Date.now() - 6 * 3600_000) } },
+      orderBy: [{ startAt: 'asc' }, { id: 'asc' }], take: take + 1, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}), include: { place: true, syncs: true },
     });
     const page = rows.slice(0, take);
     return {

@@ -1,4 +1,4 @@
-import { Body, Controller, HttpCode, Post } from '@nestjs/common';
+import { Body, Controller, HttpCode, Ip, Post } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { CreateSessionDto, EnrollVehicleDeviceDto, RefreshDto } from './auth.dto';
 import { Public } from './principal';
@@ -19,7 +19,7 @@ export class AuthController {
 
   /** 차량 AAOS 앱 부트스트랩. 응답의 deviceToken 을 안전 저장(EncryptedSharedPreferences 등)하고 이후 Bearer 로 사용. */
   @Public() @Post('devices/vehicle/enroll')
-  enroll(@Body() dto: EnrollVehicleDeviceDto) {
-    return this.auth.enrollVehicleDevice(dto);
+  enroll(@Body() dto: EnrollVehicleDeviceDto, @Ip() ip: string) {
+    return this.auth.enrollVehicleDevice(dto, ip);
   }
 }

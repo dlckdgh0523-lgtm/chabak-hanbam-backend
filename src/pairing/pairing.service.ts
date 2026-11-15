@@ -67,11 +67,15 @@ export class PairingService {
   async revokeLink(p: UserPrincipal, linkId: string) {
     const link = await this.prisma.vehicleLink.findFirst({ where: { id: linkId, userId: p.userId } });
     if (!link) throw notFound('link');
-    await this.prisma.$transaction([
-      this.prisma.vehicleLink.update({ where: { id: linkId }, data: { status: 'REVOKED', revokedAt: new Date() } }),
-      // 장치 토큰 폐기 (BLE 키 폐기는 BLE 도입 시 추가)
-      this.prisma.device.update({ where: { id: link.deviceId }, data: { revokedAt: new Date(), tokenHash: null } }),
-    ]);
+    const deviceRevoked = await this.prisma.$transaction(async (tx) => {
+      await tx.vehicleLink.update({ where: { id: linkId }, data: { status: 'REVOKED', revokedAt: new Date() } });
+      // 같은 차를 쓰는 다른 사용자가 있으면 장치 토큰은 살린다 (BLE 키 폐기는 BLE 도입 시 추가)
+      if (await tx.vehicleLink.count({ where: { deviceId: link.deviceId, status: 'ACTIVE' } })) return false;
+      await tx.device.update({ where: { id: link.deviceId }, data: { revokedAt: new Date(), tokenHash: null } });
+      return true;
+    });
     this.events.publish({ type: 'LINK_HEALTH_CHANGED', aggregateId: link.vehicleId, payload: { linkId, status: 'REVOKED' } });
+    this.events.bus.emit('revoked', { principals: [`USER:${link.userId}`], vehicleId: link.vehicleId });
+    if (deviceRevoked) this.events.bus.emit('revoked', { principals: [`DEVICE:${link.deviceId}`] });
   }
 }

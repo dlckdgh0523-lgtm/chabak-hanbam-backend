@@ -1,7 +1,7 @@
 import { CallHandler, ExecutionContext, Injectable, NestInterceptor, SetMetadata } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { createHash } from 'crypto';
-import { Observable, from, of, switchMap, tap } from 'rxjs';
+import { Observable, catchError, concatMap, from, map, of, switchMap, throwError } from 'rxjs';
 import { PrismaService } from '../prisma/prisma.service';
 import { ApiError } from './errors';
 import { principalKey } from '../auth/principal';
@@ -11,6 +11,7 @@ export const IDEMPOTENT_KEY = 'idempotent';
 export const Idempotent = () => SetMetadata(IDEMPOTENT_KEY, true);
 
 const TTL_MS = 24 * 3600 * 1000;
+const PENDING = 0; // 선점만 하고 아직 응답이 없는 기록
 
 @Injectable()
 export class IdempotencyInterceptor implements NestInterceptor {
@@ -33,18 +34,27 @@ export class IdempotencyInterceptor implements NestInterceptor {
       switchMap((rec) => {
         if (rec) {
           if (rec.requestHash !== requestHash) throw new ApiError('IDEMPOTENCY_CONFLICT', 'same Idempotency-Key with different body');
+          if (rec.statusCode === PENDING) throw new ApiError('IDEMPOTENCY_CONFLICT', 'same Idempotency-Key still in progress; retry later');
           res.status(rec.statusCode);
           res.setHeader('idempotent-replayed', 'true');
           return of(rec.response);
         }
-        return next.handle().pipe(
-          tap((body) => {
-            void this.prisma.idempotencyRecord
-              .create({
-                data: { principal, route, key, requestHash, statusCode: res.statusCode, response: body ?? {}, expiresAt: new Date(Date.now() + TTL_MS) },
-              })
-              .catch(() => undefined); // 동시 요청 race: 첫 기록만 남는다
-          }),
+        // 실행 전에 키를 선점한다. 동시에 온 같은 키는 unique 충돌로 한 건만 실행된다.
+        const where = { principal_route_key: { principal, route, key } };
+        const reserve = this.prisma.idempotencyRecord
+          .create({ data: { principal, route, key, requestHash, statusCode: PENDING, response: {}, expiresAt: new Date(Date.now() + TTL_MS) } })
+          .catch((e: { code?: string }) => {
+            if (e.code === 'P2002') throw new ApiError('IDEMPOTENCY_CONFLICT', 'same Idempotency-Key still in progress; retry later');
+            throw e;
+          });
+        return from(reserve).pipe(
+          switchMap(() =>
+            next.handle().pipe(
+              concatMap((body) => from(this.prisma.idempotencyRecord.update({ where, data: { statusCode: res.statusCode, response: body ?? {} } })).pipe(map(() => body))),
+              // 실패한 요청은 선점을 풀어 같은 키로 재시도할 수 있게 한다 (선점에 실패한 요청은 여기 오지 않음)
+              catchError((e) => from(this.prisma.idempotencyRecord.delete({ where }).catch(() => undefined)).pipe(switchMap(() => throwError(() => e)))),
+            ),
+          ),
         );
       }),
     );

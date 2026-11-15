@@ -10,6 +10,8 @@ async function bootstrap() {
   app.setGlobalPrefix('v1');
   app.use(requestIdMiddleware);
   app.useWebSocketAdapter(new WsAdapter(app));
+  // 프론트 live 모드(로컬 미리보기 서버)용. 운영에서는 열지 않는다.
+  if (process.env.NODE_ENV !== 'production') app.enableCors({ origin: ['http://localhost:8080', 'http://127.0.0.1:8080', 'https://appassets.androidplatform.net'] }); // 마지막은 안드로이드 WebView(WebViewAssetLoader) origin
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true, forbidUnknownValues: true }));
   app.enableShutdownHooks();
   const port = Number(process.env.PORT ?? 3000);
